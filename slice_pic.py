@@ -36,6 +36,7 @@ class SliceConfig:
     overlap: int
     padding_color: Tuple[int, int, int]
     visualize: bool = False
+    clear_pad: float = 0.0  # 0.0=無効, 0.0~1.0=パディング面積の閾値
     
     def __post_init__(self):
         """設定の妥当性チェック"""
@@ -74,6 +75,7 @@ class ImageTileSlicer:
         self.config = config
         self.total_tiles = 0
         self.total_shapes = 0
+        self.skipped_pad_tiles = 0  # パディング領域のみのタイルをスキップした数
         # 出力ディレクトリに連番を付ける
         self.config.output_dir = self._get_numbered_output_dir(config.output_dir)
     
@@ -355,11 +357,130 @@ class ImageTileSlicer:
             # エラーが発生した場合はスキップ
             return None
     
+    def is_polygon_only_in_padding(
+        self,
+        points: List[List[float]],
+        tile: TileInfo
+    ) -> bool:
+        """
+        ポリゴンがパディング領域にのみ存在するかチェック
+        
+        Args:
+            points: タイル座標系のポリゴン座標
+            tile: タイル情報
+        
+        Returns:
+            パディング領域にのみ存在する場合True
+        """
+        if not points or not tile.needs_padding:
+            return False
+        
+        # パディングが必要なタイルの場合、元画像の有効範囲を取得
+        valid_width = tile.actual_width
+        valid_height = tile.actual_height
+        
+        # すべての頂点がパディング領域にあるかチェック
+        # パディング領域 = x >= valid_width または y >= valid_height
+        all_in_padding = True
+        for x, y in points:
+            # 少なくとも一つの頂点が有効領域内にある場合
+            if x < valid_width and y < valid_height:
+                all_in_padding = False
+                break
+        
+        return all_in_padding
+    
+    def has_shapes_only_in_padding(
+        self,
+        tile_label: Dict,
+        tile: TileInfo
+    ) -> bool:
+        """
+        タイルラベルのすべてのshapeがパディング領域にのみ存在するかチェック
+        
+        Args:
+            tile_label: タイルのラベルデータ
+            tile: タイル情報
+        
+        Returns:
+            すべてのshapeがパディング領域にのみ存在する場合True
+        """
+        if not tile.needs_padding:
+            return False
+        
+        shapes = tile_label.get("shapes", [])
+        if not shapes:
+            return False
+        
+        # すべてのshapeがパディング領域にのみ存在するかチェック
+        for shape in shapes:
+            points = shape.get("points", [])
+            if not self.is_polygon_only_in_padding(points, tile):
+                return False
+        
+        return True
+    
+    def get_padding_ratio(self, tile: TileInfo) -> float:
+        """
+        タイルのパディング面積の割合を計算
+        
+        Args:
+            tile: タイル情報
+        
+        Returns:
+            パディング面積の割合（0.0~1.0）
+        """
+        if not tile.needs_padding:
+            return 0.0
+        
+        # タイル全体の面積
+        total_area = self.config.tile_width * self.config.tile_height
+        
+        # 有効領域の面積
+        valid_area = tile.actual_width * tile.actual_height
+        
+        # パディング領域の面積
+        padding_area = total_area - valid_area
+        
+        # パディング面積の割合
+        padding_ratio = padding_area / total_area
+        
+        return padding_ratio
+    
+    def should_skip_tile(self, tile_label: Dict, tile: TileInfo) -> bool:
+        """
+        タイルをスキップすべきかどうかを判定
+        
+        Args:
+            tile_label: タイルのラベルデータ
+            tile: タイル情報
+        
+        Returns:
+            スキップすべき場合True
+        """
+        if self.config.clear_pad <= 0.0:
+            return False
+        
+        if not tile.needs_padding:
+            return False
+        
+        # パディング面積の割合を取得
+        padding_ratio = self.get_padding_ratio(tile)
+        
+        # 閾値以上の場合はスキップ
+        if padding_ratio >= self.config.clear_pad:
+            # shapesがある場合のみスキップ（空のタイルは既に別の条件でスキップされる）
+            if tile_label.get("shapes"):
+                return True
+        
+        return False
+    
     def visualize_tiles(
         self,
         image: np.ndarray,
         tiles: List[TileInfo],
-        output_path: Path
+        output_path: Path,
+        label_data: Optional[Dict] = None
     ) -> None:
         """
         タイル分割を視覚化した画像を生成
@@ -368,6 +489,7 @@ class ImageTileSlicer:
             image: 元画像
             tiles: タイル情報のリスト
             output_path: 出力パス
+            label_data: ラベルデータ（clear_pad判定用、オプション）
         """
         height, width = image.shape[:2]
         
@@ -389,22 +511,54 @@ class ImageTileSlicer:
         vis_image[:height, :width] = image
         overlay[:height, :width] = image
         
+        # clear_pad判定用のタイルラベルを作成（label_dataがある場合）
+        tiles_to_delete = set()
+        if label_data:
+            for tile in tiles:
+                tile_filename = f"temp_tile_r{tile.row}_c{tile.col}.jpg"
+                tile_label = self.create_tile_label(label_data, tile, tile_filename)
+                
+                # スキップ判定（実際の処理ロジックと同じ）
+                # 1. shapesが空の場合はスキップ
+                if not tile_label.get("shapes"):
+                    tiles_to_delete.add((tile.row, tile.col))
+                # 2. clear_padオプションが有効で、パディング面積が閾値以上の場合はスキップ
+                elif self.should_skip_tile(tile_label, tile):
+                    tiles_to_delete.add((tile.row, tile.col))
+        
         # 各タイルを描画
         for tile in tiles:
-            # タイル境界（青色の矩形）
+            # タイル境界の色を決定
             tile_x_end = tile.x_start + self.config.tile_width
             tile_y_end = tile.y_start + self.config.tile_height
+            
+            is_to_delete = (tile.row, tile.col) in tiles_to_delete
+            
+            # 削除対象のタイル全体に半透明のオーバーレイを追加（黄色/オレンジ）
+            if is_to_delete:
+                cv2.rectangle(
+                    overlay,
+                    (tile.x_start, tile.y_start),
+                    (tile_x_end, tile_y_end),
+                    (0, 165, 255),  # オレンジ色（BGR）
+                    -1  # 塗りつぶし
+                )
+            
+            # タイル境界（削除対象は白色の太線、通常は青色）
+            border_color = (255, 255, 255) if is_to_delete else (255, 0, 0)  # 白色 or 青色
+            border_thickness = 5 if is_to_delete else 2
             
             cv2.rectangle(
                 vis_image,
                 (tile.x_start, tile.y_start),
                 (tile_x_end, tile_y_end),
-                (255, 0, 0),  # 青色
-                2
+                border_color,
+                border_thickness
             )
             
             # オーバーラップ領域を色付け（緑色の半透明）
-            if self.config.overlap > 0:
+            # 削除対象でない場合のみ表示
+            if self.config.overlap > 0 and not is_to_delete:
                 # 右側のオーバーラップ
                 if tile.x_end < width:
                     overlap_right = min(self.config.overlap, tile.x_end - tile.x_start)
@@ -428,7 +582,8 @@ class ImageTileSlicer:
                     )
             
             # パディングが必要な領域を色付け（赤色の半透明）
-            if tile.needs_padding:
+            # 削除対象でない場合のみ表示
+            if tile.needs_padding and not is_to_delete:
                 # 右側のパディング（元画像の範囲外）
                 if tile.actual_width < self.config.tile_width:
                     pad_x_start = tile.x_start + tile.actual_width
@@ -456,21 +611,95 @@ class ImageTileSlicer:
             # タイル番号をテキストで表示
             text = f"r{tile.row}c{tile.col}"
             text_pos = (tile.x_start + 5, tile.y_start + 20)
+            text_color = (255, 255, 255) if is_to_delete else (255, 255, 0)  # 白色 or シアン色
+            text_thickness = 2 if is_to_delete else 2
+            
+            # 削除対象の場合は背景を付ける
+            if is_to_delete:
+                # テキストのサイズを取得
+                (text_width, text_height), baseline = cv2.getTextSize(
+                    text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_thickness
+                )
+                # 黒い背景を描画
+                cv2.rectangle(
+                    vis_image,
+                    (text_pos[0] - 2, text_pos[1] - text_height - 2),
+                    (text_pos[0] + text_width + 2, text_pos[1] + baseline + 2),
+                    (0, 0, 0),
+                    -1
+                )
+            
             cv2.putText(
                 vis_image,
                 text,
                 text_pos,
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                (255, 255, 0),  # シアン色
-                2
+                text_color,
+                text_thickness
             )
+            
+            # 削除対象のタイルにXマークを描画
+            if is_to_delete:
+                # タイルの中心を計算
+                center_x = tile.x_start + self.config.tile_width // 2
+                center_y = tile.y_start + self.config.tile_height // 2
+                
+                # Xマークのサイズ
+                mark_size = min(self.config.tile_width, self.config.tile_height) // 4
+                
+                # 斜め線を描画（左上から右下）
+                cv2.line(
+                    vis_image,
+                    (center_x - mark_size, center_y - mark_size),
+                    (center_x + mark_size, center_y + mark_size),
+                    (255, 255, 255),  # 白色
+                    6
+                )
+                
+                # 斜め線を描画（右上から左下）
+                cv2.line(
+                    vis_image,
+                    (center_x + mark_size, center_y - mark_size),
+                    (center_x - mark_size, center_y + mark_size),
+                    (255, 255, 255),  # 白色
+                    6
+                )
+                
+                # "SKIP"テキストを表示
+                skip_text = "SKIP"
+                skip_text_size = 0.9
+                skip_text_thickness = 3
+                (skip_width, skip_height), skip_baseline = cv2.getTextSize(
+                    skip_text, cv2.FONT_HERSHEY_SIMPLEX, skip_text_size, skip_text_thickness
+                )
+                skip_text_pos = (center_x - skip_width // 2, center_y + mark_size + skip_height + 15)
+                
+                # SKIPテキストの背景（黒）
+                cv2.rectangle(
+                    vis_image,
+                    (skip_text_pos[0] - 5, skip_text_pos[1] - skip_height - 5),
+                    (skip_text_pos[0] + skip_width + 5, skip_text_pos[1] + skip_baseline + 5),
+                    (0, 0, 0),
+                    -1
+                )
+                
+                # SKIPテキスト（白）
+                cv2.putText(
+                    vis_image,
+                    skip_text,
+                    skip_text_pos,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    skip_text_size,
+                    (255, 255, 255),  # 白色
+                    skip_text_thickness
+                )
         
         # 半透明を合成（透明度30%）
         vis_image = cv2.addWeighted(vis_image, 0.7, overlay, 0.3, 0)
         
         # 凡例を追加
-        legend_height = 100
+        legend_height = 120 if (self.config.clear_pad and tiles_to_delete) else 100
         legend = np.zeros((legend_height, extended_width, 3), dtype=np.uint8)
         legend[:] = (50, 50, 50)  # 濃いグレー背景
         
@@ -483,6 +712,11 @@ class ImageTileSlicer:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         cv2.putText(legend, "Red: Padding region", (10, 90), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        
+        # clear_padで削除されるタイルがある場合、凡例に追加
+        if self.config.clear_pad > 0.0 and tiles_to_delete:
+            cv2.putText(legend, f"Orange + White X: Skipped tiles (clear_pad) [{len(tiles_to_delete)} tiles]", (10, 110), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
         
         # 画像と凡例を結合
         final_image = np.vstack([vis_image, legend])
@@ -586,7 +820,7 @@ class ImageTileSlicer:
             vis_dir.mkdir(parents=True, exist_ok=True)
             
             vis_output_path = vis_dir / f"{label_path.stem}_visualization.jpg"
-            self.visualize_tiles(image, tiles, vis_output_path)
+            self.visualize_tiles(image, tiles, vis_output_path, label_data)
         
         # 各タイルを処理
         tile_count = 0
@@ -602,6 +836,11 @@ class ImageTileSlicer:
             
             # shapesが空の場合はスキップ（オブジェクトがないタイル）
             if not tile_label["shapes"]:
+                continue
+            
+            # clear_padオプションが有効で、パディング面積が閾値以上の場合はスキップ
+            if self.should_skip_tile(tile_label, tile):
+                self.skipped_pad_tiles += 1
                 continue
             
             # 保存
@@ -638,6 +877,8 @@ class ImageTileSlicer:
         tqdm.write(f"パディング色: {self.config.padding_color}")
         if self.config.visualize:
             tqdm.write(f"可視化: 有効 (visualization/に保存)")
+        if self.config.clear_pad > 0.0:
+            tqdm.write(f"パディング削除閾値: {self.config.clear_pad:.2%} 以上のパディング面積でスキップ")
         tqdm.write("-" * 70)
         
         # 出力ディレクトリ作成
@@ -664,10 +905,12 @@ class ImageTileSlicer:
         
         # 完了メッセージ
         tqdm.write("\n" + "=" * 70)
-        tqdm.write("✅ 完了！")
+        tqdm.write("完了！")
         tqdm.write(f"   処理ファイル数: {len(label_files)}個")
         tqdm.write(f"   生成タイル数: {self.total_tiles}個")
         tqdm.write(f"   変換shape数: {self.total_shapes}個")
+        if self.config.clear_pad > 0.0 and self.skipped_pad_tiles > 0:
+            tqdm.write(f"   スキップ（パディング{self.config.clear_pad:.2%}以上）: {self.skipped_pad_tiles}個")
         if self.config.visualize:
             tqdm.write(f"   視覚化画像: {len(label_files)}枚生成")
             tqdm.write(f"   視覚化保存先: {self.config.output_dir / 'visualization'}")
@@ -723,6 +966,12 @@ def main():
   # 視覚化モード（タイル分割 + プレビュー画像を生成）
   python slice_pic.py -i ./dataset/images -o ./dataset/sliced --vis
   
+  # パディング面積が50%以上のタイルを削除
+  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --clear_pad 0.5
+  
+  # パディング面積が75%以上のタイルを削除（視覚化付き）
+  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --clear_pad 0.75 --vis
+  
   # すべてのオプションを指定
   python slice_pic.py -i ./dataset/images -o ./dataset/sliced --tile-size 640x640 --overlap 50
 
@@ -734,6 +983,7 @@ def main():
   - オブジェクトが含まれないタイルは自動スキップ
   - 視覚化モード（--vis）でタイル分割を確認可能（visualizationフォルダーに保存）
   - パディング領域も正確に可視化
+  - パディング面積の閾値でタイルを削除（--clear_pad 0.0~1.0）
         """
     )
     
@@ -772,6 +1022,15 @@ def main():
         help='視覚化モード: タイル分割と視覚化画像を同時に生成（visualizationフォルダーに保存）'
     )
     
+    parser.add_argument(
+        '--clear_pad', '--clear-pad',
+        type=float,
+        default=0.0,
+        dest='clear_pad',
+        metavar='RATIO',
+        help='パディング面積の閾値（0.0~1.0）: この割合以上のパディングを含むタイルを削除（例: 0.5=50%%, 0.75=75%%）'
+    )
+    
     args = parser.parse_args()
     
     # 入力ディレクトリの確認
@@ -786,6 +1045,11 @@ def main():
         tqdm.write(f"❌ エラー: {e}")
         return
     
+    # clear_padの値をチェック
+    if args.clear_pad < 0.0 or args.clear_pad > 1.0:
+        tqdm.write(f"❌ エラー: --clear_padの値は0.0~1.0の範囲で指定してください（指定値: {args.clear_pad}）")
+        return
+    
     # 設定を作成
     try:
         config = SliceConfig(
@@ -795,7 +1059,8 @@ def main():
             tile_height=tile_height,
             overlap=args.overlap,
             padding_color=DEFAULT_PADDING_COLOR,
-            visualize=args.visualize
+            visualize=args.visualize,
+            clear_pad=args.clear_pad
         )
     except ValueError as e:
         tqdm.write(f"❌ エラー: {e}")

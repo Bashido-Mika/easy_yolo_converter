@@ -67,8 +67,8 @@ pip install -r requirements.txt
 pip install -r requirements.txt
 
 # 2. （オプション）画像をタイル分割（slice_pic.py）
-# --vis を追加すると視覚化画像も生成されます
-python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --vis
+# --vis で視覚化、--clear_pad 0.5 でパディング50%以上のタイルを削除
+python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --vis --clear_pad 0.5
 
 # 3. インスタンスをクロップ（crop_and_segment.py）
 python crop_and_segment.py -i PodSegDataset/train -o PodSegDataset/crop
@@ -103,6 +103,12 @@ python slice_pic.py -i ./dataset/train -o ./dataset/sliced
 
 # タイルサイズとオーバーラップを指定
 python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-size 1024 --overlap 100
+
+# パディング面積が50%以上のタイルを削除
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --clear_pad 0.5
+
+# パディング面積が75%以上のタイルを削除（視覚化付き）
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --clear_pad 0.75 --vis
 ```
 
 ### 視覚化モード
@@ -132,8 +138,49 @@ dataset/
 - **緑色の領域**: オーバーラップ領域（半透明）
 - **赤色の領域**: パディング領域（半透明）
 - **グレー背景**: パディング色（114,114,114）で埋められた領域
+- **オレンジ色のタイル + 白色Xマーク + "SKIP"**: `--clear_pad`オプションで削除されるタイル
 
 パディング領域も含めて正確に可視化されるため、画像サイズがタイルサイズの倍数でない場合でも、どのようにパディングされるか確認できます。
+
+`--clear_pad`オプションと`--vis`オプションを併用すると、削除されるタイルが**オレンジ色の半透明オーバーレイ**、**白色の太いXマーク**、**白色の"SKIP"テキスト**で明確に表示されます。削除対象のタイルは通常のタイル（青色の枠線）と一目で区別できます。
+
+### パディング面積によるタイル削除
+
+`--clear_pad`オプションで、パディング面積の割合が一定以上のタイルを自動的に削除できます。
+
+```bash
+# パディング面積が50%以上のタイルを削除
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --clear_pad 0.5
+
+# パディング面積が75%以上のタイルを削除
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --clear_pad 0.75
+```
+
+**指定方法:**
+- 値は `0.0`~`1.0` の範囲で指定
+- `0.5` = 50%、`0.75` = 75%、`1.0` = 100%
+- 指定した割合以上のパディング面積を持つタイルが削除される
+
+**パディング面積の計算:**
+- タイル全体の面積 = タイル幅 × タイル高さ
+- 有効領域の面積 = 元画像が実際に存在する領域
+- パディング面積 = タイル全体 - 有効領域
+- パディング割合 = パディング面積 ÷ タイル全体の面積
+
+**使用例:**
+- `--clear_pad 0.3`: パディングが30%以上のタイルを削除（緩い）
+- `--clear_pad 0.5`: パディングが50%以上のタイルを削除（標準）
+- `--clear_pad 0.7`: パディングが70%以上のタイルを削除（厳しい）
+
+このオプションは、学習に不要なパディング領域の多いデータを削除し、データセットの品質を向上させます。
+
+**視覚化と併用:**
+```bash
+# 視覚化と併用して削除されるタイルを確認
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --clear_pad 0.5 --vis
+```
+
+視覚化画像では、削除されるタイルに**オレンジ色の半透明オーバーレイ**、**白色の太い枠線**、**中央に白色の大きなXマーク**、**白色の"SKIP"テキスト**が表示されます。削除対象のタイルは背景色が変わるため、通常のタイルと一目で区別でき、視覚的に非常にわかりやすくなっています。
 
 ### コマンドラインオプション
 
@@ -142,6 +189,7 @@ dataset/
 - `-t, --tile-size`: タイルサイズ（例: 640 または 640x640）（デフォルト: 640）
 - `-ov, --overlap`: オーバーラップのピクセル数（デフォルト: 50）
 - `--vis`: 視覚化モード（タイル分割 + 視覚化画像を生成）
+- `--clear_pad RATIO`: パディング面積の閾値（0.0~1.0）。この割合以上のパディングを含むタイルを削除（例: 0.5=50%, 0.75=75%）
 
 ## 特徴
 
@@ -150,8 +198,9 @@ dataset/
 - **自動パディング**: 端数部分は自動でパディング（YOLO標準の背景色: 114,114,114）
 - **ラベル変換**: ポリゴン座標を自動変換（Shapely使用）
 - **空タイルスキップ**: オブジェクトが含まれないタイルは自動スキップ
+- **パディング面積によるフィルタリング**: --clear_pad RATIOオプションでパディング面積が指定割合以上のタイルを削除（0.0~1.0で指定）
 - **視覚化モード**: --visオプションでタイル分割と視覚化画像を同時生成（visualizationサブフォルダーに保存）
-- **パディング可視化**: 視覚化画像でパディング領域も正確に表示
+- **見やすい視覚化**: 削除対象タイルはオレンジ色の背景＋白色のXマークで一目で識別可能
 
 ## 出力形式
 
@@ -515,8 +564,8 @@ model.train(
 
 ```bash
 # 1. 画像をタイル分割（大きな画像を小さいタイルに分割）
-# --vis を追加すると視覚化画像も同時に生成されます
-python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-size 640 --overlap 50 --vis
+# --vis で視覚化、--clear_pad 0.5 でパディング50%以上のタイルを削除
+python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-size 640 --overlap 50 --vis --clear_pad 0.5
 
 # 2. インスタンスをクロップ
 python crop_and_segment.py -i PodSegDataset/sliced -o PodSegDataset/crop
@@ -534,6 +583,7 @@ yolo train data=data.yaml model=yolov8n.pt epochs=100 imgsz=640
 
 **ポイント**: 
 - ステップ1で--visオプションを使えば、タイル分割と視覚化画像を同時に生成できます
+- ステップ1で--clear_pad 0.5を指定すれば、パディング50%以上のタイルを自動削除できます
 - ステップ4で`data.yaml`が自動生成されるので、手動で作成する必要はありません
 
 ---
