@@ -35,6 +35,7 @@ class SliceConfig:
     tile_height: int
     overlap: int
     padding_color: Tuple[int, int, int]
+    visualize: bool = False
     
     def __post_init__(self):
         """設定の妥当性チェック"""
@@ -73,6 +74,34 @@ class ImageTileSlicer:
         self.config = config
         self.total_tiles = 0
         self.total_shapes = 0
+        # 出力ディレクトリに連番を付ける
+        self.config.output_dir = self._get_numbered_output_dir(config.output_dir)
+    
+    def _get_numbered_output_dir(self, base_dir: Path) -> Path:
+        """
+        出力ディレクトリに連番を付ける
+        
+        Args:
+            base_dir: 基本の出力ディレクトリパス
+        
+        Returns:
+            連番付きの出力ディレクトリパス
+        """
+        # ディレクトリが存在しない場合はそのまま使用
+        if not base_dir.exists():
+            return base_dir
+        
+        # 既にファイルがある場合は連番を付ける
+        if list(base_dir.iterdir()):
+            # 連番を探す
+            counter = 2
+            while True:
+                numbered_dir = Path(f"{base_dir}{counter:02d}")
+                if not numbered_dir.exists() or not list(numbered_dir.iterdir()):
+                    return numbered_dir
+                counter += 1
+        
+        return base_dir
     
     def load_label_file(self, label_path: Path) -> Optional[Dict]:
         """
@@ -326,6 +355,141 @@ class ImageTileSlicer:
             # エラーが発生した場合はスキップ
             return None
     
+    def visualize_tiles(
+        self,
+        image: np.ndarray,
+        tiles: List[TileInfo],
+        output_path: Path
+    ) -> None:
+        """
+        タイル分割を視覚化した画像を生成
+        
+        Args:
+            image: 元画像
+            tiles: タイル情報のリスト
+            output_path: 出力パス
+        """
+        height, width = image.shape[:2]
+        
+        # パディング領域も含めて必要なサイズを計算
+        max_x = max(tile.x_start + self.config.tile_width for tile in tiles)
+        max_y = max(tile.y_start + self.config.tile_height for tile in tiles)
+        
+        # 拡張されたキャンバスを作成（パディング色で埋める）
+        extended_width = max(width, max_x)
+        extended_height = max(height, max_y)
+        vis_image = np.full(
+            (extended_height, extended_width, 3),
+            self.config.padding_color,
+            dtype=np.uint8
+        )
+        overlay = vis_image.copy()
+        
+        # 元画像を貼り付け
+        vis_image[:height, :width] = image
+        overlay[:height, :width] = image
+        
+        # 各タイルを描画
+        for tile in tiles:
+            # タイル境界（青色の矩形）
+            tile_x_end = tile.x_start + self.config.tile_width
+            tile_y_end = tile.y_start + self.config.tile_height
+            
+            cv2.rectangle(
+                vis_image,
+                (tile.x_start, tile.y_start),
+                (tile_x_end, tile_y_end),
+                (255, 0, 0),  # 青色
+                2
+            )
+            
+            # オーバーラップ領域を色付け（緑色の半透明）
+            if self.config.overlap > 0:
+                # 右側のオーバーラップ
+                if tile.x_end < width:
+                    overlap_right = min(self.config.overlap, tile.x_end - tile.x_start)
+                    cv2.rectangle(
+                        overlay,
+                        (tile.x_end - overlap_right, tile.y_start),
+                        (min(tile.x_end, width), min(tile_y_end, height)),
+                        (0, 255, 0),  # 緑色
+                        -1
+                    )
+                
+                # 下側のオーバーラップ
+                if tile.y_end < height:
+                    overlap_bottom = min(self.config.overlap, tile.y_end - tile.y_start)
+                    cv2.rectangle(
+                        overlay,
+                        (tile.x_start, tile.y_end - overlap_bottom),
+                        (min(tile_x_end, width), min(tile.y_end, height)),
+                        (0, 255, 0),  # 緑色
+                        -1
+                    )
+            
+            # パディングが必要な領域を色付け（赤色の半透明）
+            if tile.needs_padding:
+                # 右側のパディング（元画像の範囲外）
+                if tile.actual_width < self.config.tile_width:
+                    pad_x_start = tile.x_start + tile.actual_width
+                    pad_x_end = tile.x_start + self.config.tile_width
+                    cv2.rectangle(
+                        overlay,
+                        (pad_x_start, tile.y_start),
+                        (pad_x_end, tile_y_end),
+                        (0, 0, 255),  # 赤色
+                        -1
+                    )
+                
+                # 下側のパディング（元画像の範囲外）
+                if tile.actual_height < self.config.tile_height:
+                    pad_y_start = tile.y_start + tile.actual_height
+                    pad_y_end = tile.y_start + self.config.tile_height
+                    cv2.rectangle(
+                        overlay,
+                        (tile.x_start, pad_y_start),
+                        (tile_x_end, pad_y_end),
+                        (0, 0, 255),  # 赤色
+                        -1
+                    )
+            
+            # タイル番号をテキストで表示
+            text = f"r{tile.row}c{tile.col}"
+            text_pos = (tile.x_start + 5, tile.y_start + 20)
+            cv2.putText(
+                vis_image,
+                text,
+                text_pos,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 0),  # シアン色
+                2
+            )
+        
+        # 半透明を合成（透明度30%）
+        vis_image = cv2.addWeighted(vis_image, 0.7, overlay, 0.3, 0)
+        
+        # 凡例を追加
+        legend_height = 100
+        legend = np.zeros((legend_height, extended_width, 3), dtype=np.uint8)
+        legend[:] = (50, 50, 50)  # 濃いグレー背景
+        
+        # 凡例テキスト
+        cv2.putText(legend, "Tile Visualization:", (10, 25), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(legend, "Blue: Tile boundary", (10, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        cv2.putText(legend, "Green: Overlap region", (10, 70), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(legend, "Red: Padding region", (10, 90), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        
+        # 画像と凡例を結合
+        final_image = np.vstack([vis_image, legend])
+        
+        # 保存
+        cv2.imwrite(str(output_path), final_image)
+    
     def create_tile_label(
         self,
         original_label: Dict,
@@ -415,6 +579,15 @@ class ImageTileSlicer:
         # タイル位置を計算
         tiles = self.calculate_tiles(width, height)
         
+        # 視覚化モードの場合、視覚化画像を生成
+        if self.config.visualize:
+            # visualizationサブディレクトリを作成
+            vis_dir = self.config.output_dir / "visualization"
+            vis_dir.mkdir(parents=True, exist_ok=True)
+            
+            vis_output_path = vis_dir / f"{label_path.stem}_visualization.jpg"
+            self.visualize_tiles(image, tiles, vis_output_path)
+        
         # 各タイルを処理
         tile_count = 0
         base_name = label_path.stem
@@ -423,7 +596,7 @@ class ImageTileSlicer:
             # タイル画像を切り出し
             tile_image = self.extract_tile(image, tile)
             
-            # タイル用のラベルを作成
+            # ファイル名を生成（元の画像名 + タイル位置）
             tile_filename = f"{base_name}_tile_r{tile.row}_c{tile.col}.jpg"
             tile_label = self.create_tile_label(label_data, tile, tile_filename)
             
@@ -453,13 +626,18 @@ class ImageTileSlicer:
         """
         # ヘッダー表示
         tqdm.write("=" * 70)
-        tqdm.write("Image Tile Slicer (X-AnyLabeling Format)")
+        if self.config.visualize:
+            tqdm.write("Image Tile Slicer (X-AnyLabeling Format) + Visualization")
+        else:
+            tqdm.write("Image Tile Slicer (X-AnyLabeling Format)")
         tqdm.write("=" * 70)
         tqdm.write(f"入力: {self.config.input_dir}")
         tqdm.write(f"出力: {self.config.output_dir}")
         tqdm.write(f"タイルサイズ: {self.config.tile_width}x{self.config.tile_height}")
         tqdm.write(f"オーバーラップ: {self.config.overlap}px")
         tqdm.write(f"パディング色: {self.config.padding_color}")
+        if self.config.visualize:
+            tqdm.write(f"可視化: 有効 (visualization/に保存)")
         tqdm.write("-" * 70)
         
         # 出力ディレクトリ作成
@@ -472,12 +650,15 @@ class ImageTileSlicer:
             tqdm.write("❌ エラー: ラベルファイル（.json）が見つかりません")
             return False
         
-        tqdm.write(f"処理開始: {len(label_files)}個のラベルファイルを処理します\n")
+        if self.config.visualize:
+            desc = "タイル分割+可視化"
+        else:
+            desc = "タイル分割処理中"
         
         # 各ファイルを処理
-        with tqdm(label_files, desc="ファイル処理", ncols=100) as pbar:
+        with tqdm(label_files, desc=desc, ncols=100, unit="file") as pbar:
             for label_path in pbar:
-                pbar.set_postfix_str(label_path.name)
+                pbar.set_postfix_str(label_path.name[:30])  # ファイル名を30文字に制限
                 tile_count = self.process_single_file(label_path)
                 self.total_tiles += tile_count
         
@@ -487,6 +668,9 @@ class ImageTileSlicer:
         tqdm.write(f"   処理ファイル数: {len(label_files)}個")
         tqdm.write(f"   生成タイル数: {self.total_tiles}個")
         tqdm.write(f"   変換shape数: {self.total_shapes}個")
+        if self.config.visualize:
+            tqdm.write(f"   視覚化画像: {len(label_files)}枚生成")
+            tqdm.write(f"   視覚化保存先: {self.config.output_dir / 'visualization'}")
         tqdm.write(f"   出力先: {self.config.output_dir}")
         tqdm.write("=" * 70)
         
@@ -536,14 +720,20 @@ def main():
   # オーバーラップを変更
   python slice_pic.py -i ./dataset/images -o ./dataset/sliced --overlap 100
   
+  # 視覚化モード（タイル分割 + プレビュー画像を生成）
+  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --vis
+  
   # すべてのオプションを指定
   python slice_pic.py -i ./dataset/images -o ./dataset/sliced --tile-size 640x640 --overlap 50
 
 特徴:
+  - 連番ディレクトリで上書きを防止（sliced → sliced02 → sliced03）
   - オーバーラップ分割で境界のオブジェクトを確実にキャプチャ
   - 端数部分は自動パディング（YOLO標準の背景色: 114,114,114）
   - ラベル座標を自動変換
   - オブジェクトが含まれないタイルは自動スキップ
+  - 視覚化モード（--vis）でタイル分割を確認可能（visualizationフォルダーに保存）
+  - パディング領域も正確に可視化
         """
     )
     
@@ -575,6 +765,13 @@ def main():
         help=f'オーバーラップのピクセル数 (デフォルト: {DEFAULT_OVERLAP})'
     )
     
+    parser.add_argument(
+        '--vis', '--visualize',
+        action='store_true',
+        dest='visualize',
+        help='視覚化モード: タイル分割と視覚化画像を同時に生成（visualizationフォルダーに保存）'
+    )
+    
     args = parser.parse_args()
     
     # 入力ディレクトリの確認
@@ -597,7 +794,8 @@ def main():
             tile_width=tile_width,
             tile_height=tile_height,
             overlap=args.overlap,
-            padding_color=DEFAULT_PADDING_COLOR
+            padding_color=DEFAULT_PADDING_COLOR,
+            visualize=args.visualize
         )
     except ValueError as e:
         tqdm.write(f"❌ エラー: {e}")

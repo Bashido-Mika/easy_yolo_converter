@@ -7,8 +7,9 @@
 - [概要](#概要)
 - [必要なライブラリ](#必要なライブラリ)
 - [クイックスタート](#クイックスタート)
-- [ツール1: Crop and Segment Tool](#ツール1-crop-and-segment-tool)
-- [ツール2: YOLO Dataset Splitter](#ツール2-yolo-dataset-splitter)
+- [ツール1: Image Tile Slicer](#ツール1-image-tile-slicer)
+- [ツール2: Crop and Segment Tool](#ツール2-crop-and-segment-tool)
+- [ツール3: YOLO Dataset Splitter](#ツール3-yolo-dataset-splitter)
 - [完全なワークフロー](#完全なワークフロー)
 - [トラブルシューティング](#トラブルシューティング)
 
@@ -16,7 +17,10 @@
 
 ## 概要
 
-このプロジェクトには2つの主要なツールが含まれています：
+このプロジェクトには3つの主要なツールが含まれています：
+
+### 🔹 slice_pic.py
+X-AnyLabeling形式の画像をタイル分割します。オーバーラップとパディングに対応し、ラベルも正確に変換します。連番出力で上書きを防止し、視覚化モード（--vis）でタイル分割をプレビューできます。
 
 ### 🔹 crop_and_segment.py
 X-AnyLabeling形式のインスタンスセグメンテーションラベルから各インスタンスをクロップし、クロップ画像の座標系で新しいラベルを作成します。
@@ -47,7 +51,8 @@ pip install -r requirements.txt
 **必要なライブラリ：**
 - `numpy>=1.21.0`: 座標計算・配列操作用
 - `opencv-python>=4.5.0`: 画像の読み込み・保存・クロップ処理用
-- `tqdm>=4.62.0`: プログレスバー表示用
+- `shapely>=2.0.0`: ポリゴン演算用（タイル分割時のクリッピング）
+- `tqdm>=4.62.0`: 進捗表示用
 - `scikit-learn>=1.0.0`: データセット分割用（train_test_split）
 - `pyyaml>=6.0`: data.yaml生成用
 
@@ -61,38 +66,134 @@ pip install -r requirements.txt
 # 1. ライブラリをインストール
 pip install -r requirements.txt
 
-# 2. インスタンスをクロップ（crop_and_segment.py）
+# 2. （オプション）画像をタイル分割（slice_pic.py）
+# --vis を追加すると視覚化画像も生成されます
+python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --vis
+
+# 3. インスタンスをクロップ（crop_and_segment.py）
 python crop_and_segment.py -i PodSegDataset/train -o PodSegDataset/crop
 
-# 3. （別途）YOLO形式に変換
+# 4. （別途）YOLO形式に変換
 # convert_to_yolo.py などを使用
 
-# 4. データセットを分割（yolo_split.py）
+# 5. データセットを分割（yolo_split.py）
 python yolo_split.py -i Yolo_crop -o Yolo_split --class-names pod
 
-# 5. YOLOv8でトレーニング
+# 6. YOLOv8でトレーニング
 cd Yolo_split
 yolo train data=data.yaml model=yolov8n.pt epochs=100 imgsz=640
 ```
 
-### 📊 動作確認
+---
 
-サンプルファイルで動作確認：
+# ツール1: Image Tile Slicer
+
+X-AnyLabeling形式の画像をタイル分割します。オーバーラップとパディングに対応し、ラベルも正確に変換します。
+
+## 使い方
+
+### 基本的な使い方
 
 ```bash
-# 1つのファイルだけ処理してみる
-python crop_and_segment.py -i PodSegDataset/train/VID_20220226_0924511_30.json -o test_output
+# デフォルト設定で実行（640x640、オーバーラップ50px）
+python slice_pic.py
+
+# 入力と出力を指定
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced
+
+# タイルサイズとオーバーラップを指定
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-size 1024 --overlap 100
 ```
 
-実行中はプログレスバーが表示されます：
+### 視覚化モード
+
+`--vis`オプションを付けると、通常のタイル分割に加えて視覚化画像も生成されます：
+
+```bash
+# 視覚化モード（タイル分割 + プレビュー画像を生成）
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --vis
+```
+
+**出力構造:**
+```
+dataset/
+└── sliced/
+    ├── xxx_tile_r0_c0.jpg      # 通常のタイル画像
+    ├── xxx_tile_r0_c0.json     # ラベル
+    ├── xxx_tile_r0_c1.jpg
+    ├── ...
+    └── visualization/          # 視覚化画像
+        ├── xxx_visualization.jpg
+        └── yyy_visualization.jpg
+```
+
+視覚化画像では以下の情報が表示されます：
+- **青色の矩形**: タイルの境界
+- **緑色の領域**: オーバーラップ領域（半透明）
+- **赤色の領域**: パディング領域（半透明）
+- **グレー背景**: パディング色（114,114,114）で埋められた領域
+
+パディング領域も含めて正確に可視化されるため、画像サイズがタイルサイズの倍数でない場合でも、どのようにパディングされるか確認できます。
+
+### コマンドラインオプション
+
+- `-i, --input`: 入力ディレクトリ（デフォルト: `PodSegDataset/train02`）
+- `-o, --output`: 出力ディレクトリ（デフォルト: `PodSegDataset/sliced`）
+- `-t, --tile-size`: タイルサイズ（例: 640 または 640x640）（デフォルト: 640）
+- `-ov, --overlap`: オーバーラップのピクセル数（デフォルト: 50）
+- `--vis`: 視覚化モード（タイル分割 + 視覚化画像を生成）
+
+## 特徴
+
+- **連番ディレクトリ出力**: 実行するたびに自動で連番ディレクトリを作成（sliced → sliced02 → sliced03）し、上書きを防止
+- **オーバーラップ対応**: 境界のオブジェクトを確実にキャプチャ
+- **自動パディング**: 端数部分は自動でパディング（YOLO標準の背景色: 114,114,114）
+- **ラベル変換**: ポリゴン座標を自動変換（Shapely使用）
+- **空タイルスキップ**: オブジェクトが含まれないタイルは自動スキップ
+- **視覚化モード**: --visオプションでタイル分割と視覚化画像を同時生成（visualizationサブフォルダーに保存）
+- **パディング可視化**: 視覚化画像でパディング領域も正確に表示
+
+## 出力形式
+
+### 通常モード
+
+実行するたびに連番ディレクトリが作成されます：
 
 ```
-ファイル処理: 100%|██████████| 1/1 [00:02<00:00] VID_20220226_0924511_30.json -> 49個
+PodSegDataset/
+├── sliced/                 # 1回目の実行
+│   ├── VID_xxx_tile_r0_c0.jpg
+│   ├── VID_xxx_tile_r0_c0.json
+│   ├── VID_xxx_tile_r0_c1.jpg
+│   └── ...
+├── sliced02/               # 2回目の実行
+│   ├── VID_yyy_tile_r0_c0.jpg
+│   └── ...
+└── sliced03/               # 3回目の実行
+    └── ...
+```
+
+### 視覚化モード（--vis）
+
+視覚化画像はvisualizationサブフォルダーに保存され、通常のタイル分割も同時に実行されます：
+
+```
+PodSegDataset/
+└── sliced/
+    ├── VID_xxx_tile_r0_c0.jpg      # タイル画像
+    ├── VID_xxx_tile_r0_c0.json     # ラベル
+    ├── VID_xxx_tile_r0_c1.jpg
+    ├── VID_xxx_tile_r0_c1.json
+    ├── ...
+    └── visualization/              # 視覚化画像
+        ├── VID_xxx_visualization.jpg
+        ├── VID_yyy_visualization.jpg
+        └── ...
 ```
 
 ---
 
-# ツール1: Crop and Segment Tool
+# ツール2: Crop and Segment Tool
 
 インスタンスセグメンテーションラベルから各インスタンスをクロップし、クロップ画像の座標系で新しいラベルを作成するツールです。
 
@@ -252,39 +353,11 @@ python crop_and_segment.py -i ./labels -o ./output -p 20 -m --mask-buffer 8
 - 背景: 透明
 - ファイル名例: `image_0.png`
 
-## エラー処理
-
-スクリプトは以下の問題を検出し、自動的にスキップして処理を継続します：
-
-- **無効なバウンディングボックス**: サイズが0のバウンディングボックス
-- **ポリゴンのポイント不足**: 3点未満のポリゴン
-- **空のクロップ画像**: クロップ結果が空の画像
-- **画像保存の失敗**: ファイル書き込みエラー
-- **その他の予期しないエラー**: 各インスタンスで発生したエラー
-
-処理完了後、スキップされたインスタンスの総数が表示されます：
-
-```
-全処理完了: 合計 19845個のインスタンスをクロップしました
-スキップ: 23個のインスタンス（無効なデータ、エラーなど）
-```
-
 ---
 
-# ツール2: YOLO Dataset Splitter
+# ツール3: YOLO Dataset Splitter
 
 YOLO形式のデータセットをtrain/val/testに分割し、**Ultralytics用のdata.yamlを自動生成**します。scikit-learnの`train_test_split`を使用して効率的に分割します。
-
-## ✨ 特徴
-
-- ✅ **scikit-learn**: 効率的で信頼性の高い`train_test_split`を使用
-- ✅ **data.yaml自動生成**: Ultralytics（YOLOv8）用の設定ファイルを自動作成
-- ✅ **CLI対応**: コマンドラインから簡単に実行
-- ✅ **デフォルト設定**: すぐに使える便利なデフォルト値
-- ✅ **確実**: ファイルペアの検証機能付き
-- ✅ **プログレスバー**: 進捗状況を視覚的に確認
-- ✅ **再現性**: ランダムシード設定で同じ分割を再現可能
-- ✅ **安全**: 元データは変更せず、コピーのみ
 
 ## 使い方
 
@@ -407,70 +480,6 @@ names:
 python yolo_split.py -i Yolo_crop -o Yolo_split --class-names pod flower leaf
 ```
 
-## 実行例
-
-```bash
-$ python yolo_split.py -i Yolo_crop -o Yolo_split --class-names pod
-
-============================================================
-YOLO Dataset Splitter
-============================================================
-入力: Yolo_crop
-出力: Yolo_split
-分割比率: Train=0.7, Val=0.2, Test=0.1
-ランダムシード: 42
-------------------------------------------------------------
-データセットを確認しています...
-
-📊 データセット情報:
-   正常なペア: 1000組
-------------------------------------------------------------
-
-データセットを分割しています...
-
-分割結果:
-  Train:  700組 ( 70.0%)
-  Val:    200組 ( 20.0%)
-  Test:   100組 ( 10.0%)
-  合計:  1000組
-------------------------------------------------------------
-
-ファイルを Yolo_split にコピーしています...
-
-train: 100%|████████████████████| 700/700 [00:05<00:00, 132.15it/s]
-val:   100%|████████████████████| 200/200 [00:01<00:00, 135.21it/s]
-test:  100%|████████████████████| 100/100 [00:00<00:00, 138.45it/s]
-
-------------------------------------------------------------
-
-出力ディレクトリの確認:
-  📁 train: 画像= 700枚, ラベル= 700個
-  📁 val:   画像= 200枚, ラベル= 200個
-  📁 test:  画像= 100枚, ラベル= 100個
-
-------------------------------------------------------------
-
-data.yaml を生成しています...
-   検出されたクラスID: [0]
-   使用するクラス名: ['pod']
-   ✅ data.yaml を作成しました: Yolo_split\data.yaml
-
-📄 data.yaml の内容:
-   path: D:/prog_py/crop_and_seg/Yolo_split
-   train: train/images
-   val: val/images
-   test: test/images
-   nc: 1
-   names:
-   - pod
-
-============================================================
-✅ 完了！
-   出力先: Yolo_split
-   data.yaml: Yolo_split\data.yaml
-============================================================
-```
-
 ## YOLOv8との統合（Ultralytics）
 
 生成された`data.yaml`を使ってそのままトレーニング可能：
@@ -505,25 +514,45 @@ model.train(
 ### エンドツーエンドの処理例
 
 ```bash
-# 1. インスタンスをクロップ
-python crop_and_segment.py -i PodSegDataset/train -o PodSegDataset/crop
+# 1. 画像をタイル分割（大きな画像を小さいタイルに分割）
+# --vis を追加すると視覚化画像も同時に生成されます
+python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-size 640 --overlap 50 --vis
 
-# 2. （別途）YOLO形式に変換
+# 2. インスタンスをクロップ
+python crop_and_segment.py -i PodSegDataset/sliced -o PodSegDataset/crop
+
+# 3. （別途）YOLO形式に変換
 # convert_to_yolo.py などを使用
 
-# 3. データセットを分割（data.yaml も自動生成）
+# 4. データセットを分割（data.yaml も自動生成）
 python yolo_split.py -i Yolo_crop -o Yolo_split --train 0.7 --val 0.2 --test 0.1 --class-names pod
 
-# 4. YOLOv8でトレーニング（自動生成されたdata.yamlを使用）
+# 5. YOLOv8でトレーニング（自動生成されたdata.yamlを使用）
 cd Yolo_split
 yolo train data=data.yaml model=yolov8n.pt epochs=100 imgsz=640
 ```
 
-**ポイント**: ステップ3で`data.yaml`が自動生成されるので、手動で作成する必要はありません！
+**ポイント**: 
+- ステップ1で--visオプションを使えば、タイル分割と視覚化画像を同時に生成できます
+- ステップ4で`data.yaml`が自動生成されるので、手動で作成する必要はありません
 
 ---
 
 ## トラブルシューティング
+
+### slice_pic.py 関連
+
+#### ❌ ラベルファイル（.json）が見つかりません
+
+入力ディレクトリにX-AnyLabeling形式のJSONファイルが存在することを確認してください。
+
+#### ❌ 画像が見つかりません
+
+ラベルファイル（JSON）と画像ファイル（JPG/PNG）が同じディレクトリにあることを確認してください。
+
+#### 💡 視覚化モードで確認
+
+タイル分割を実行する前に、`--vis`オプションで視覚化画像を生成し、タイルサイズとオーバーラップが適切か確認することをお勧めします。
 
 ### crop_and_segment.py 関連
 
@@ -539,10 +568,6 @@ python crop_and_segment.py -i ./labels -img ./images -o ./output
 #### ❌ OpenCV エラー: !_img.empty()
 
 バウンディングボックスのサイズが0、またはクロップ結果が空の画像です。このエラーは自動的にスキップされ、処理が継続されます。
-
-#### ⚠️ プログレスバーの表示が崩れる
-
-すべての出力は`tqdm.write()`を使用しているため、プログレスバーとの表示崩れは発生しません。
 
 ### yolo_split.py 関連
 
@@ -602,13 +627,15 @@ python crop_and_segment.py -i ./PodSegDataset/train/file1.json -o ./output
 ## プロジェクト構造
 
 ```
-crop_and_seg/
-├── crop_and_segment.py      # インスタンスクロップツール
+easy_yolo_converter/
+├── slice_pic.py              # タイル分割ツール
+├── crop_and_segment.py       # インスタンスクロップツール
 ├── yolo_split.py             # YOLOデータセット分割ツール
 ├── requirements.txt          # 必要なライブラリ
 ├── README.md                 # このファイル
 ├── PodSegDataset/           # サンプルデータセット
-│   ├── train/               # 学習データ（X-AnyLabeling形式）
+│   ├── train02/             # 学習データ（X-AnyLabeling形式）
+│   ├── sliced/              # タイル分割結果
 │   ├── val/                 # 検証データ
 │   ├── test/                # テストデータ
 │   └── crop/                # クロップ結果の出力先
@@ -630,4 +657,3 @@ crop_and_seg/
 - [Ultralytics YOLOv8公式ドキュメント](https://docs.ultralytics.com/)
 - [YOLO形式について](https://docs.ultralytics.com/datasets/detect/)
 - [scikit-learn train_test_split](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.train_test_split.html)
-- [tqdm プログレスバーの使い方](https://qiita.com/kuroitu/items/f18acf87269f4267e8c1)
