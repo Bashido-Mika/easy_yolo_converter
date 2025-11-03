@@ -20,7 +20,7 @@
 このプロジェクトには3つの主要なツールが含まれています：
 
 ### 🔹 slice_pic.py
-X-AnyLabeling形式の画像をタイル分割します。オーバーラップとパディングに対応し、ラベルも正確に変換します。連番出力で上書きを防止し、視覚化モード（--vis）でタイル分割をプレビューできます。
+X-AnyLabeling形式の画像をタイル分割します。2つのモード（Padding/Inner）、柔軟なオーバーラップ指定（ピクセル/割合）、視覚化機能を備えています。
 
 ### 🔹 crop_and_segment.py
 X-AnyLabeling形式のインスタンスセグメンテーションラベルから各インスタンスをクロップし、クロップ画像の座標系で新しいラベルを作成します。
@@ -67,8 +67,8 @@ pip install -r requirements.txt
 pip install -r requirements.txt
 
 # 2. （オプション）画像をタイル分割（slice_pic.py）
-# --vis で視覚化、--clear_pad 0.5 でパディング50%以上のタイルを削除
-python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --vis --clear_pad 0.5
+# --tile-mode inner で内側モード、--overlap-ratio 0.3 で30%オーバーラップ
+python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-mode inner --overlap-ratio 0.3 --vis
 
 # 3. インスタンスをクロップ（crop_and_segment.py）
 python crop_and_segment.py -i PodSegDataset/train -o PodSegDataset/crop
@@ -95,20 +95,35 @@ X-AnyLabeling形式の画像をタイル分割します。オーバーラップ�
 ### 基本的な使い方
 
 ```bash
-# デフォルト設定で実行（640x640、オーバーラップ50px）
+# デフォルト設定で実行（640x640、オーバーラップ50px、paddingモード）
 python slice_pic.py
 
 # 入力と出力を指定
 python slice_pic.py -i ./dataset/train -o ./dataset/sliced
 
-# タイルサイズとオーバーラップを指定
-python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-size 1024 --overlap 100
+# タイルサイズを指定（正方形）
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-size 1024
 
-# パディング面積が50%以上のタイルを削除
+# タイルサイズを指定（矩形）
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-size 1280x720
+
+# オーバーラップを変更（ピクセル指定）
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --overlap 100
+
+# オーバーラップを割合で指定（30%）
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --overlap-ratio 0.3
+
+# 内側オーバーラップモード（パディングなし）
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-mode inner
+
+# パディング面積が50%以上のタイルを削除（paddingモードのみ）
 python slice_pic.py -i ./dataset/train -o ./dataset/sliced --clear_pad 0.5
 
 # パディング面積が75%以上のタイルを削除（視覚化付き）
 python slice_pic.py -i ./dataset/train -o ./dataset/sliced --clear_pad 0.75 --vis
+
+# すべてのオプションを指定
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-size 640x640 --overlap 50 --tile-mode padding --vis
 ```
 
 ### 視覚化モード
@@ -134,15 +149,79 @@ dataset/
 ```
 
 視覚化画像では以下の情報が表示されます：
-- **青色の矩形**: タイルの境界
+- **青色の矩形**: 指定サイズ通りのタイル（完全なサイズ）
+- **黄色の矩形**: 調整されたタイル（サイズが不完全、端数処理など）
 - **緑色の領域**: オーバーラップ領域（半透明）
-- **赤色の領域**: パディング領域（半透明）
+- **赤色の領域**: パディング領域（半透明、paddingモードのみ）
 - **グレー背景**: パディング色（114,114,114）で埋められた領域
 - **オレンジ色のタイル + 白色Xマーク + "SKIP"**: `--clear_pad`オプションで削除されるタイル
 
 パディング領域も含めて正確に可視化されるため、画像サイズがタイルサイズの倍数でない場合でも、どのようにパディングされるか確認できます。
 
 `--clear_pad`オプションと`--vis`オプションを併用すると、削除されるタイルが**オレンジ色の半透明オーバーレイ**、**白色の太いXマーク**、**白色の"SKIP"テキスト**で明確に表示されます。削除対象のタイルは通常のタイル（青色の枠線）と一目で区別できます。
+
+### タイルモード（Padding vs Inner）
+
+画像を2つの方式でタイル分割できます：
+
+#### Paddingモード（デフォルト）
+```bash
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-mode padding
+```
+- 端数部分を**パディング**（YOLO標準の背景色: 114,114,114）で埋める
+- 元画像のサイズは変更されない
+- 画像の端でタイルサイズに満たない場合、パディングで埋める
+- `--clear_pad`オプションでパディング面積が大きいタイルを削除可能
+
+#### Innerモード（内側オーバーラップ）
+```bash
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-mode inner
+# オーバーラップも指定可能
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-mode inner --overlap-ratio 0.3
+```
+- 画像の**外にはみ出さない**ように、最後のタイルを内側に配置
+- パディングは発生しない（通常のタイルは完全なサイズ）
+- **オーバーラップは指定可能**（`--overlap`または`--overlap-ratio`）
+- 最後のタイルは前のタイルと指定以上にオーバーラップする可能性がある（内側調整のため）
+- `--clear_pad`オプションは使用不可（パディングがないため）
+
+**特殊ケース:**
+- 画像サイズがタイルサイズより小さい場合、画像全体を1つのタイルとして扱う
+- この場合、オーバーラップ指定は適用されない（1タイルのみ）
+
+**どちらを選ぶべきか？**
+- **Paddingモード**: パディング領域を許容できる場合、均等なオーバーラップが必要な場合
+- **Innerモード**: パディングを避けたい場合、元画像の情報のみを使いたい場合
+
+### オーバーラップの指定方法
+
+オーバーラップは2つの方法で指定できます：
+
+#### ピクセル指定（デフォルト）
+```bash
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --overlap 50
+```
+- オーバーラップを**ピクセル数**で指定
+- 例: `--overlap 50` → 50ピクセルのオーバーラップ
+
+#### 割合指定
+```bash
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --overlap-ratio 0.3
+```
+- オーバーラップを**割合**で指定（0.0~1.0未満）
+- 例: `--overlap-ratio 0.3` → 30%のオーバーラップ
+- タイルサイズに応じて自動的にピクセル数に変換される
+- `--overlap-ratio`を指定した場合は`--overlap`より優先される
+
+**どちらを使うべきか？**
+- **ピクセル指定**: 固定のオーバーラップサイズが必要な場合
+- **割合指定**: タイルサイズに応じて柔軟にオーバーラップを調整したい場合
+
+**注意**: 両方指定した場合、`--overlap-ratio`が優先されます。
+```bash
+# この場合、0.3（30%）が使用され、100pxは無視される
+python slice_pic.py --overlap 100 --overlap-ratio 0.3
+```
 
 ### パディング面積によるタイル削除
 
@@ -184,22 +263,36 @@ python slice_pic.py -i ./dataset/train -o ./dataset/sliced --clear_pad 0.5 --vis
 
 ### コマンドラインオプション
 
+**基本オプション:**
 - `-i, --input`: 入力ディレクトリ（デフォルト: `PodSegDataset/train02`）
 - `-o, --output`: 出力ディレクトリ（デフォルト: `PodSegDataset/sliced`）
 - `-t, --tile-size`: タイルサイズ（例: 640 または 640x640）（デフォルト: 640）
+
+**オーバーラップ設定:**
 - `-ov, --overlap`: オーバーラップのピクセル数（デフォルト: 50）
+- `-ovr, --overlap-ratio`: オーバーラップの割合（0.0~1.0未満、例: 0.3=30%）※指定した場合は`--overlap`より優先
+
+**タイルモード:**
+- `--tile-mode {padding,inner}`: タイル作成モード（デフォルト: padding）
+  - `padding`: パディングで埋める
+  - `inner`: 内側オーバーラップ（画像の外にはみ出さない）
+
+**その他:**
 - `--vis`: 視覚化モード（タイル分割 + 視覚化画像を生成）
-- `--clear_pad RATIO`: パディング面積の閾値（0.0~1.0）。この割合以上のパディングを含むタイルを削除（例: 0.5=50%, 0.75=75%）
+- `--clear_pad RATIO`: パディング面積の閾値（0.0~1.0）。この割合以上のパディングを含むタイルを削除（例: 0.5=50%, 0.75=75%）※paddingモードのみ有効
 
 ## 特徴
 
+- **2つのタイルモード**:
+  - **Paddingモード**: 端数部分を自動パディング（YOLO標準の背景色: 114,114,114）
+  - **Innerモード**: 内側オーバーラップ（画像の外にはみ出さない、パディングなし）
+- **柔軟なオーバーラップ指定**: ピクセル数または割合（%）で指定可能
 - **連番ディレクトリ出力**: 実行するたびに自動で連番ディレクトリを作成（sliced → sliced02 → sliced03）し、上書きを防止
 - **オーバーラップ対応**: 境界のオブジェクトを確実にキャプチャ
-- **自動パディング**: 端数部分は自動でパディング（YOLO標準の背景色: 114,114,114）
-- **ラベル変換**: ポリゴン座標を自動変換（Shapely使用）
+- **ラベル自動変換**: ポリゴン座標を自動変換（Shapely使用）
 - **空タイルスキップ**: オブジェクトが含まれないタイルは自動スキップ
-- **パディング面積によるフィルタリング**: --clear_pad RATIOオプションでパディング面積が指定割合以上のタイルを削除（0.0~1.0で指定）
-- **視覚化モード**: --visオプションでタイル分割と視覚化画像を同時生成（visualizationサブフォルダーに保存）
+- **パディング面積フィルタリング**: `--clear_pad`オプションでパディング面積が指定割合以上のタイルを削除（paddingモードのみ）
+- **視覚化モード**: `--vis`オプションでタイル分割と視覚化画像を同時生成
 - **見やすい視覚化**: 削除対象タイルはオレンジ色の背景＋白色のXマークで一目で識別可能
 
 ## 出力形式
@@ -564,8 +657,11 @@ model.train(
 
 ```bash
 # 1. 画像をタイル分割（大きな画像を小さいタイルに分割）
-# --vis で視覚化、--clear_pad 0.5 でパディング50%以上のタイルを削除
-python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-size 640 --overlap 50 --vis --clear_pad 0.5
+# Innerモード、30%オーバーラップ、視覚化付き
+python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-mode inner --overlap-ratio 0.3 --vis
+
+# または、Paddingモードで不要なタイルを削除
+# python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-mode padding --overlap 50 --clear_pad 0.5 --vis
 
 # 2. インスタンスをクロップ
 python crop_and_segment.py -i PodSegDataset/sliced -o PodSegDataset/crop
@@ -582,8 +678,11 @@ yolo train data=data.yaml model=yolov8n.pt epochs=100 imgsz=640
 ```
 
 **ポイント**: 
-- ステップ1で--visオプションを使えば、タイル分割と視覚化画像を同時に生成できます
-- ステップ1で--clear_pad 0.5を指定すれば、パディング50%以上のタイルを自動削除できます
+- ステップ1で2つのモードから選択可能：
+  - **Innerモード**: パディングなし（画像の外にはみ出さない）
+  - **Paddingモード**: 元画像を保持（`--clear_pad`で不要タイル削除可能）
+- オーバーラップはピクセル数（`--overlap`）または割合（`--overlap-ratio`）で指定可能
+- `--vis`オプションで視覚化画像を生成して確認可能
 - ステップ4で`data.yaml`が自動生成されるので、手動で作成する必要はありません
 
 ---

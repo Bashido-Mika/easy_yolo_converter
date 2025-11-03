@@ -23,7 +23,9 @@ DEFAULT_INPUT_DIR = 'PodSegDataset/train02'
 DEFAULT_OUTPUT_DIR = 'PodSegDataset/sliced'
 DEFAULT_TILE_SIZE = 640
 DEFAULT_OVERLAP = 50
+DEFAULT_OVERLAP_RATIO = 0.0  # 0.0=無効（ピクセル指定を使用）
 DEFAULT_PADDING_COLOR = (114, 114, 114)  # YOLO標準の背景色
+DEFAULT_TILE_MODE = 'padding'  # 'padding' or 'inner'
 
 
 @dataclass
@@ -37,15 +39,33 @@ class SliceConfig:
     padding_color: Tuple[int, int, int]
     visualize: bool = False
     clear_pad: float = 0.0  # 0.0=無効, 0.0~1.0=パディング面積の閾値
+    tile_mode: str = 'padding'  # 'padding' or 'inner'
+    overlap_ratio: float = 0.0  # 0.0=無効（overlap使用）、0.0~1.0=オーバーラップ割合
     
     def __post_init__(self):
         """設定の妥当性チェック"""
         if self.tile_width <= 0 or self.tile_height <= 0:
             raise ValueError("タイルサイズは正の値である必要があります")
-        if self.overlap < 0:
-            raise ValueError("オーバーラップは0以上である必要があります")
-        if self.overlap >= min(self.tile_width, self.tile_height):
-            raise ValueError("オーバーラップはタイルサイズより小さい必要があります")
+        
+        # オーバーラップの妥当性チェック
+        if self.overlap_ratio > 0.0:
+            # 割合指定の場合
+            if self.overlap_ratio < 0.0 or self.overlap_ratio >= 1.0:
+                raise ValueError("オーバーラップ割合は0.0以上1.0未満である必要があります")
+        else:
+            # ピクセル指定の場合
+            if self.overlap < 0:
+                raise ValueError("オーバーラップは0以上である必要があります")
+            if self.overlap >= min(self.tile_width, self.tile_height):
+                raise ValueError("オーバーラップはタイルサイズより小さい必要があります")
+        
+        # タイルモードの妥当性チェック
+        if self.tile_mode not in ['padding', 'inner']:
+            raise ValueError("tile_modeは'padding'または'inner'である必要があります")
+        
+        # innerモードではclear_padは使用できない
+        if self.tile_mode == 'inner' and self.clear_pad > 0.0:
+            raise ValueError("innerモードではclear_padオプションは使用できません（パディングが発生しないため）")
 
 
 @dataclass
@@ -153,6 +173,22 @@ class ImageTileSlicer:
         
         return None
     
+    def get_effective_overlap(self) -> Tuple[int, int]:
+        """
+        実効的なオーバーラップをピクセル単位で取得
+        
+        Returns:
+            (overlap_x, overlap_y)のタプル
+        """
+        if self.config.overlap_ratio > 0.0:
+            # 割合指定の場合、ピクセル数に変換
+            overlap_x = int(self.config.tile_width * self.config.overlap_ratio)
+            overlap_y = int(self.config.tile_height * self.config.overlap_ratio)
+            return overlap_x, overlap_y
+        else:
+            # ピクセル指定の場合
+            return self.config.overlap, self.config.overlap
+    
     def calculate_tiles(
         self, 
         image_width: int, 
@@ -169,8 +205,9 @@ class ImageTileSlicer:
             タイル情報のリスト
         """
         tiles = []
-        stride_x = self.config.tile_width - self.config.overlap
-        stride_y = self.config.tile_height - self.config.overlap
+        overlap_x, overlap_y = self.get_effective_overlap()
+        stride_x = self.config.tile_width - overlap_x
+        stride_y = self.config.tile_height - overlap_y
         
         row = 0
         y_start = 0
@@ -205,6 +242,101 @@ class ImageTileSlicer:
                     needs_padding=needs_padding
                 ))
                 
+                x_start += stride_x
+                col += 1
+                
+                # 最後のタイルに到達したら終了
+                if x_end >= image_width:
+                    break
+            
+            y_start += stride_y
+            row += 1
+            
+            # 最後のタイルに到達したら終了
+            if y_end >= image_height:
+                break
+        
+        return tiles
+    
+    def calculate_tiles_inner_mode(
+        self,
+        image_width: int,
+        image_height: int
+    ) -> List[TileInfo]:
+        """
+        タイル位置を計算（内側モード: 画像の外にはみ出さないように内側でオーバーラップ）
+        最後のタイルを内側にずらして配置し、パディングを発生させない
+        
+        Args:
+            image_width: 画像の幅
+            image_height: 画像の高さ
+        
+        Returns:
+            タイル情報のリスト
+        
+        Note:
+            画像サイズがタイルサイズより小さい場合、1つのタイルのみ作成され、
+            指定したオーバーラップは適用されません。
+        """
+        tiles = []
+        overlap_x, overlap_y = self.get_effective_overlap()
+        stride_x = self.config.tile_width - overlap_x
+        stride_y = self.config.tile_height - overlap_y
+        
+        # 画像がタイルサイズより小さい場合の特殊処理
+        if image_width <= self.config.tile_width and image_height <= self.config.tile_height:
+            # 画像全体を1つのタイルとして扱う（オーバーラップは適用されない）
+            tiles.append(TileInfo(
+                row=0,
+                col=0,
+                x_start=0,
+                y_start=0,
+                x_end=image_width,
+                y_end=image_height,
+                actual_width=image_width,
+                actual_height=image_height,
+                needs_padding=True  # 実際にはパディングしないが、サイズが不足していることを示す
+            ))
+            return tiles
+        
+        row = 0
+        y_start = 0
+        while y_start < image_height:
+            col = 0
+            x_start = 0
+            
+            while x_start < image_width:
+                # 通常の終了位置を計算
+                x_end = x_start + self.config.tile_width
+                y_end = y_start + self.config.tile_height
+                
+                # 画像の外にはみ出す場合、内側にずらす
+                if x_end > image_width:
+                    x_end = image_width
+                    x_start = max(0, x_end - self.config.tile_width)
+                
+                if y_end > image_height:
+                    y_end = image_height
+                    y_start = max(0, y_end - self.config.tile_height)
+                
+                # 実際のタイルサイズ
+                actual_width = x_end - x_start
+                actual_height = y_end - y_start
+                
+                # innerモードではパディングは発生しない
+                tiles.append(TileInfo(
+                    row=row,
+                    col=col,
+                    x_start=x_start,
+                    y_start=y_start,
+                    x_end=x_end,
+                    y_end=y_end,
+                    actual_width=actual_width,
+                    actual_height=actual_height,
+                    needs_padding=False
+                ))
+                
+                # 次の位置へ移動
                 x_start += stride_x
                 col += 1
                 
@@ -493,23 +625,35 @@ class ImageTileSlicer:
         """
         height, width = image.shape[:2]
         
-        # パディング領域も含めて必要なサイズを計算
-        max_x = max(tile.x_start + self.config.tile_width for tile in tiles)
-        max_y = max(tile.y_start + self.config.tile_height for tile in tiles)
+        # 必要なキャンバスサイズを計算
+        # innerモードの場合: 元画像と同じサイズ
+        # paddingモードの場合: タイル境界を含む拡張サイズ
+        if self.config.tile_mode == 'inner':
+            extended_width = width
+            extended_height = height
+        else:
+            # paddingモード: パディング領域も含めて計算
+            max_x = max(tile.x_start + self.config.tile_width for tile in tiles)
+            max_y = max(tile.y_start + self.config.tile_height for tile in tiles)
+            extended_width = max(width, max_x)
+            extended_height = max(height, max_y)
         
-        # 拡張されたキャンバスを作成（パディング色で埋める）
-        extended_width = max(width, max_x)
-        extended_height = max(height, max_y)
-        vis_image = np.full(
-            (extended_height, extended_width, 3),
-            self.config.padding_color,
-            dtype=np.uint8
-        )
-        overlay = vis_image.copy()
-        
-        # 元画像を貼り付け
-        vis_image[:height, :width] = image
-        overlay[:height, :width] = image
+        # キャンバスを作成
+        if extended_width > width or extended_height > height:
+            # パディング領域がある場合、パディング色で埋める
+            vis_image = np.full(
+                (extended_height, extended_width, 3),
+                self.config.padding_color,
+                dtype=np.uint8
+            )
+            overlay = vis_image.copy()
+            # 元画像を貼り付け
+            vis_image[:height, :width] = image
+            overlay[:height, :width] = image
+        else:
+            # パディングなしの場合、元画像をコピー
+            vis_image = image.copy()
+            overlay = image.copy()
         
         # clear_pad判定用のタイルラベルを作成（label_dataがある場合）
         tiles_to_delete = set()
@@ -544,9 +688,22 @@ class ImageTileSlicer:
                     -1  # 塗りつぶし
                 )
             
-            # タイル境界（削除対象は白色の太線、通常は青色）
-            border_color = (255, 255, 255) if is_to_delete else (255, 0, 0)  # 白色 or 青色
-            border_thickness = 5 if is_to_delete else 2
+            # タイル境界の色を決定
+            if is_to_delete:
+                # 削除対象は白色の太線
+                border_color = (255, 255, 255)
+                border_thickness = 5
+            else:
+                # 完全なサイズかどうかで色分け
+                is_full_size = (tile.actual_width == self.config.tile_width and 
+                               tile.actual_height == self.config.tile_height)
+                if is_full_size:
+                    # 指定サイズ通りのタイル: 青色
+                    border_color = (255, 0, 0)
+                else:
+                    # サイズが不完全なタイル（調整された）: 黄色
+                    border_color = (0, 255, 255)
+                border_thickness = 2
             
             cv2.rectangle(
                 vis_image,
@@ -558,28 +715,39 @@ class ImageTileSlicer:
             
             # オーバーラップ領域を色付け（緑色の半透明）
             # 削除対象でない場合のみ表示
-            if self.config.overlap > 0 and not is_to_delete:
-                # 右側のオーバーラップ
-                if tile.x_end < width:
-                    overlap_right = min(self.config.overlap, tile.x_end - tile.x_start)
-                    cv2.rectangle(
-                        overlay,
-                        (tile.x_end - overlap_right, tile.y_start),
-                        (min(tile.x_end, width), min(tile_y_end, height)),
-                        (0, 255, 0),  # 緑色
-                        -1
-                    )
-                
-                # 下側のオーバーラップ
-                if tile.y_end < height:
-                    overlap_bottom = min(self.config.overlap, tile.y_end - tile.y_start)
-                    cv2.rectangle(
-                        overlay,
-                        (tile.x_start, tile.y_end - overlap_bottom),
-                        (min(tile_x_end, width), min(tile.y_end, height)),
-                        (0, 255, 0),  # 緑色
-                        -1
-                    )
+            if not is_to_delete:
+                # 実際のオーバーラップ領域を計算（前のタイルとの重複部分）
+                for other_tile in tiles:
+                    if other_tile.row == tile.row and other_tile.col == tile.col:
+                        continue  # 自分自身はスキップ
+                    
+                    # 右側のタイル（col + 1）とのオーバーラップ
+                    if other_tile.row == tile.row and other_tile.col == tile.col + 1:
+                        # 重複領域を計算
+                        overlap_start = max(tile.x_start, other_tile.x_start)
+                        overlap_end = min(tile.x_end, other_tile.x_end)
+                        if overlap_start < overlap_end:
+                            cv2.rectangle(
+                                overlay,
+                                (overlap_start, tile.y_start),
+                                (overlap_end, min(tile.y_end, height)),
+                                (0, 255, 0),  # 緑色
+                                -1
+                            )
+                    
+                    # 下側のタイル（row + 1）とのオーバーラップ
+                    if other_tile.col == tile.col and other_tile.row == tile.row + 1:
+                        # 重複領域を計算
+                        overlap_start = max(tile.y_start, other_tile.y_start)
+                        overlap_end = min(tile.y_end, other_tile.y_end)
+                        if overlap_start < overlap_end:
+                            cv2.rectangle(
+                                overlay,
+                                (tile.x_start, overlap_start),
+                                (min(tile.x_end, width), overlap_end),
+                                (0, 255, 0),  # 緑色
+                                -1
+                            )
             
             # パディングが必要な領域を色付け（赤色の半透明）
             # 削除対象でない場合のみ表示
@@ -698,24 +866,38 @@ class ImageTileSlicer:
         # 半透明を合成（透明度30%）
         vis_image = cv2.addWeighted(vis_image, 0.7, overlay, 0.3, 0)
         
-        # 凡例を追加
-        legend_height = 120 if (self.config.clear_pad and tiles_to_delete) else 100
+        # 凡例を追加（innerモードではパディング情報を表示しない）
+        if self.config.tile_mode == 'inner':
+            legend_height = 110 if tiles_to_delete else 90
+        else:
+            legend_height = 140 if (self.config.clear_pad and tiles_to_delete) else 120
         legend = np.zeros((legend_height, extended_width, 3), dtype=np.uint8)
         legend[:] = (50, 50, 50)  # 濃いグレー背景
         
         # 凡例テキスト
-        cv2.putText(legend, "Tile Visualization:", (10, 25), 
+        y_pos = 25
+        cv2.putText(legend, "Tile Visualization:", (10, y_pos), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(legend, "Blue: Tile boundary", (10, 50), 
+        y_pos += 25
+        cv2.putText(legend, "Blue: Full-size tile (specified size)", (10, y_pos), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-        cv2.putText(legend, "Green: Overlap region", (10, 70), 
+        y_pos += 20
+        cv2.putText(legend, "Yellow: Adjusted tile (incomplete size)", (10, y_pos), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        y_pos += 20
+        cv2.putText(legend, "Green: Overlap region", (10, y_pos), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        cv2.putText(legend, "Red: Padding region", (10, 90), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        
+        # paddingモードの場合のみパディング情報を表示
+        if self.config.tile_mode == 'padding':
+            y_pos += 20
+            cv2.putText(legend, "Red: Padding region", (10, y_pos), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
         
         # clear_padで削除されるタイルがある場合、凡例に追加
         if self.config.clear_pad > 0.0 and tiles_to_delete:
-            cv2.putText(legend, f"Orange + White X: Skipped tiles (clear_pad) [{len(tiles_to_delete)} tiles]", (10, 110), 
+            y_pos += 20
+            cv2.putText(legend, f"Orange + White X: Skipped tiles (clear_pad) [{len(tiles_to_delete)} tiles]", (10, y_pos), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
         
         # 画像と凡例を結合
@@ -810,8 +992,11 @@ class ImageTileSlicer:
         
         height, width = image.shape[:2]
         
-        # タイル位置を計算
-        tiles = self.calculate_tiles(width, height)
+        # タイル位置を計算（モードに応じて処理を分岐）
+        if self.config.tile_mode == 'inner':
+            tiles = self.calculate_tiles_inner_mode(width, height)
+        else:
+            tiles = self.calculate_tiles(width, height)
         
         # 視覚化モードの場合、視覚化画像を生成
         if self.config.visualize:
@@ -873,8 +1058,27 @@ class ImageTileSlicer:
         tqdm.write(f"入力: {self.config.input_dir}")
         tqdm.write(f"出力: {self.config.output_dir}")
         tqdm.write(f"タイルサイズ: {self.config.tile_width}x{self.config.tile_height}")
-        tqdm.write(f"オーバーラップ: {self.config.overlap}px")
-        tqdm.write(f"パディング色: {self.config.padding_color}")
+        
+        # オーバーラップ表示
+        if self.config.overlap_ratio > 0.0:
+            overlap_x, overlap_y = self.get_effective_overlap()
+            tqdm.write(f"オーバーラップ: {self.config.overlap_ratio:.1%} ({overlap_x}x{overlap_y}px)")
+            # 両方指定されている場合は警告
+            if self.config.overlap != DEFAULT_OVERLAP:
+                tqdm.write(f"  ⚠️ 注意: --overlapと--overlap-ratioの両方が指定されています。--overlap-ratioが優先されます。")
+        else:
+            tqdm.write(f"オーバーラップ: {self.config.overlap}px")
+        
+        # タイルモード表示
+        if self.config.tile_mode == 'inner':
+            mode_str = "Inner（内側オーバーラップ、パディングなし）"
+        else:
+            mode_str = "Padding（パディングで埋める）"
+        tqdm.write(f"タイルモード: {mode_str}")
+        
+        if self.config.tile_mode == 'padding':
+            tqdm.write(f"パディング色: {self.config.padding_color}")
+        
         if self.config.visualize:
             tqdm.write(f"可視化: 有効 (visualization/に保存)")
         if self.config.clear_pad > 0.0:
@@ -948,42 +1152,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用例:
-  # デフォルト設定で実行（640x640、オーバーラップ50px）
-  python slice_pic.py
-  
-  # 入力と出力を指定
+  # 基本的な使い方
   python slice_pic.py -i ./dataset/images -o ./dataset/sliced
   
-  # タイルサイズを指定（正方形）
-  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --tile-size 1024
+  # 内側オーバーラップモード（パディングなし）
+  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --tile-mode inner
   
-  # タイルサイズを指定（矩形）
-  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --tile-size 1280x720
+  # オーバーラップを割合で指定
+  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --overlap-ratio 0.3
   
-  # オーバーラップを変更
-  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --overlap 100
-  
-  # 視覚化モード（タイル分割 + プレビュー画像を生成）
+  # 視覚化モード
   python slice_pic.py -i ./dataset/images -o ./dataset/sliced --vis
   
-  # パディング面積が50%以上のタイルを削除
-  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --clear_pad 0.5
-  
-  # パディング面積が75%以上のタイルを削除（視覚化付き）
-  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --clear_pad 0.75 --vis
-  
-  # すべてのオプションを指定
-  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --tile-size 640x640 --overlap 50
+  # パディング面積で削除（paddingモードのみ）
+  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --clear_pad 0.5 --vis
 
-特徴:
-  - 連番ディレクトリで上書きを防止（sliced → sliced02 → sliced03）
-  - オーバーラップ分割で境界のオブジェクトを確実にキャプチャ
-  - 端数部分は自動パディング（YOLO標準の背景色: 114,114,114）
-  - ラベル座標を自動変換
-  - オブジェクトが含まれないタイルは自動スキップ
-  - 視覚化モード（--vis）でタイル分割を確認可能（visualizationフォルダーに保存）
-  - パディング領域も正確に可視化
-  - パディング面積の閾値でタイルを削除（--clear_pad 0.0~1.0）
+詳細な使い方はREADME.mdを参照してください。
         """
     )
     
@@ -1013,6 +1197,24 @@ def main():
         type=int,
         default=DEFAULT_OVERLAP,
         help=f'オーバーラップのピクセル数 (デフォルト: {DEFAULT_OVERLAP})'
+    )
+    
+    parser.add_argument(
+        '-ovr', '--overlap-ratio',
+        type=float,
+        default=DEFAULT_OVERLAP_RATIO,
+        dest='overlap_ratio',
+        metavar='RATIO',
+        help=f'オーバーラップの割合（0.0~1.0未満、例: 0.3=30%%）。指定した場合は--overlapより優先される (デフォルト: {DEFAULT_OVERLAP_RATIO}=無効)'
+    )
+    
+    parser.add_argument(
+        '--tile-mode',
+        type=str,
+        choices=['padding', 'inner'],
+        default=DEFAULT_TILE_MODE,
+        dest='tile_mode',
+        help=f'タイル作成モード: padding=パディングで埋める（デフォルト）, inner=内側オーバーラップ（画像の外にはみ出さない） (デフォルト: {DEFAULT_TILE_MODE})'
     )
     
     parser.add_argument(
@@ -1050,6 +1252,18 @@ def main():
         tqdm.write(f"❌ エラー: --clear_padの値は0.0~1.0の範囲で指定してください（指定値: {args.clear_pad}）")
         return
     
+    # overlap_ratioの値をチェック
+    if args.overlap_ratio < 0.0 or args.overlap_ratio >= 1.0:
+        if args.overlap_ratio != DEFAULT_OVERLAP_RATIO:  # デフォルト値でない場合のみエラー
+            tqdm.write(f"❌ エラー: --overlap-ratioの値は0.0以上1.0未満の範囲で指定してください（指定値: {args.overlap_ratio}）")
+            return
+    
+    # innerモードとclear_padの組み合わせチェック
+    if args.tile_mode == 'inner' and args.clear_pad > 0.0:
+        tqdm.write(f"❌ エラー: --tile-mode inner と --clear_pad は同時に使用できません")
+        tqdm.write(f"   innerモードではパディングが発生しないため、clear_padオプションは無効です")
+        return
+    
     # 設定を作成
     try:
         config = SliceConfig(
@@ -1060,7 +1274,9 @@ def main():
             overlap=args.overlap,
             padding_color=DEFAULT_PADDING_COLOR,
             visualize=args.visualize,
-            clear_pad=args.clear_pad
+            clear_pad=args.clear_pad,
+            tile_mode=args.tile_mode,
+            overlap_ratio=args.overlap_ratio
         )
     except ValueError as e:
         tqdm.write(f"❌ エラー: {e}")

@@ -24,8 +24,8 @@ DEFAULT_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']
 DEFAULT_INPUT_DIR = 'Yolo_crop'
 DEFAULT_OUTPUT_DIR = 'Yolo_split'
 DEFAULT_TRAIN_RATIO = 0.7
-DEFAULT_VAL_RATIO = 0.2
-DEFAULT_TEST_RATIO = 0.1
+DEFAULT_VAL_RATIO = 0.3
+DEFAULT_TEST_RATIO = 0.0
 DEFAULT_RANDOM_SEED = 42
 
 
@@ -88,10 +88,11 @@ class YoloDatasetSplitter:
         """
         input_dir = self.config.input_dir
         
-        # 画像ファイルを収集
-        image_files = []
+        # 画像ファイルを収集（重複を避けるためセットを使用）
+        image_files_set = set()
         for ext in self.config.image_extensions:
-            image_files.extend(input_dir.glob(f"*{ext}"))
+            image_files_set.update(input_dir.glob(f"*{ext}"))
+        image_files = list(image_files_set)
         
         # 画像とラベルのペアを作成
         missing_labels = []
@@ -255,12 +256,20 @@ class YoloDatasetSplitter:
     def print_output_summary(self) -> None:
         """出力ディレクトリの概要を表示"""
         tqdm.write("\n出力ディレクトリの確認:")
-        for split_name in ["train", "val", "test"]:
+        splits_to_check = ["train", "val"]
+        if self.config.test_ratio > 0:
+            splits_to_check.append("test")
+        
+        for split_name in splits_to_check:
             images_dir = self.config.output_dir / split_name / "images"
             labels_dir = self.config.output_dir / split_name / "labels"
             
             if images_dir.exists():
-                image_count = len(list(images_dir.glob("*")))
+                # 画像ファイルのみをカウント（重複を避けるためセットを使用）
+                image_files_set = set()
+                for ext in self.config.image_extensions:
+                    image_files_set.update(images_dir.glob(f"*{ext}"))
+                image_count = len(image_files_set)
                 label_count = len(list(labels_dir.glob("*.txt")))
                 tqdm.write(f"  📁 {split_name:5s}: 画像={image_count:4d}枚, ラベル={label_count:4d}個")
     

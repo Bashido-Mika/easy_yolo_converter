@@ -19,6 +19,9 @@ test_output/
 PodSegDataset/*
 Yolo_split/*
 Yolo_crop/*
+/inner512_split
+/inner640_split
+/Yolo_split
 
 # IDEs
 .vscode/
