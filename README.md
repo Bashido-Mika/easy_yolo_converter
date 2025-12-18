@@ -68,7 +68,8 @@ pip install -r requirements.txt
 
 # 2. （オプション）画像をタイル分割（slice_pic.py）
 # --tile-mode inner で内側モード、--overlap-ratio 0.3 で30%オーバーラップ
-python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-mode inner --overlap-ratio 0.3 --vis
+# --class-cut で境界切り取り物体を"cut"クラスに変換（または --exclude-clipped で除外）
+python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-mode inner --overlap-ratio 0.3 --class-cut --vis
 
 # 3. インスタンスをクロップ（crop_and_segment.py）
 python crop_and_segment.py -i PodSegDataset/train -o PodSegDataset/crop
@@ -122,8 +123,14 @@ python slice_pic.py -i ./dataset/train -o ./dataset/sliced --clear_pad 0.5
 # パディング面積が75%以上のタイルを削除（視覚化付き）
 python slice_pic.py -i ./dataset/train -o ./dataset/sliced --clear_pad 0.75 --vis
 
+# 境界で切り取られた物体を除外
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --exclude-clipped --vis
+
+# 境界で切り取られた物体を"cut"クラスに変換
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --class-cut --vis
+
 # すべてのオプションを指定
-python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-size 640x640 --overlap 50 --tile-mode padding --vis
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-size 640x640 --overlap 50 --tile-mode padding --class-cut --vis
 ```
 
 ### 視覚化モード
@@ -261,6 +268,66 @@ python slice_pic.py -i ./dataset/train -o ./dataset/sliced --clear_pad 0.5 --vis
 
 視覚化画像では、削除されるタイルに**オレンジ色の半透明オーバーレイ**、**白色の太い枠線**、**中央に白色の大きなXマーク**、**白色の"SKIP"テキスト**が表示されます。削除対象のタイルは背景色が変わるため、通常のタイルと一目で区別でき、視覚的に非常にわかりやすくなっています。
 
+### 境界で切り取られた物体の処理
+
+タイルの境界で切り取られた物体に対して、2つの処理方法を選択できます。
+
+#### オプション1: `--exclude-clipped` - 切り取られた物体を除外
+
+タイルの境界で切り取られた物体を自動的に除外します。
+
+```bash
+# 境界で切り取られた物体を除外
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --exclude-clipped
+
+# 視覚化と併用
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --exclude-clipped --vis
+
+# 他のオプションと組み合わせ
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-mode inner --overlap-ratio 0.3 --exclude-clipped
+```
+
+**動作:**
+- タイルの境界（左端、右端、上端、下端）に頂点が存在するポリゴンを除外
+- 元画像の端にある物体は除外されない（元々の境界なので正常な物体として扱う）
+- オーバーラップ領域で完全に含まれる物体のみが残る
+
+**使用例:**
+- 学習データの品質向上: 不完全な物体（切り取られた物体）を除外
+- オーバーラップ領域での重複検出回避: 完全な物体のみを使用することで、同じ物体が複数のタイルで検出されるのを防ぐ
+- データセットのクリーンアップ: 境界で切れた不完全なラベルを自動的に除外
+
+#### オプション2: `--class-cut` - 切り取られた物体を"cut"クラスに変換
+
+タイルの境界で切り取られた物体のラベルを"cut"という特別なクラスに変換します。
+
+```bash
+# 境界で切り取られた物体を"cut"クラスに変換
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --class-cut
+
+# 視覚化と併用
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --class-cut --vis
+
+# 他のオプションと組み合わせ
+python slice_pic.py -i ./dataset/train -o ./dataset/sliced --tile-mode inner --overlap-ratio 0.3 --class-cut
+```
+
+**動作:**
+- タイルの境界で切り取られたポリゴンのラベルを"cut"に変換
+- 元画像の端にある物体は変換されない（元々の境界なので正常な物体として扱う）
+- 元のクラスラベル（例: "pod"）は"cut"に置き換えられる
+
+**使用例:**
+- 切り取られた物体を別クラスとして学習: "cut"クラスとして学習データに含める
+- 境界の切り取りを明示的に検出: 推論時に"cut"クラスとして検出可能
+- データ分析: 境界で切り取られた物体の統計を取る
+
+**注意（両オプション共通）:**
+- `--exclude-clipped`と`--class-cut`は同時に使用できません（排他的）
+- どちらのオプションも、元画像の端にある物体には影響しません
+- オーバーラップを適切に設定することで、ほとんどの物体が少なくとも1つのタイルで完全に含まれるようになります
+- 除外/変換された物体の数は処理完了時に表示されます
+
 ### コマンドラインオプション
 
 **基本オプション:**
@@ -280,6 +347,8 @@ python slice_pic.py -i ./dataset/train -o ./dataset/sliced --clear_pad 0.5 --vis
 **その他:**
 - `--vis`: 視覚化モード（タイル分割 + 視覚化画像を生成）
 - `--clear_pad RATIO`: パディング面積の閾値（0.0~1.0）。この割合以上のパディングを含むタイルを削除（例: 0.5=50%, 0.75=75%）※paddingモードのみ有効
+- `--exclude-clipped`: 境界で切り取られた物体を除外（タイルの境界で切り取られたポリゴンを除外。元画像の端にある物体は除外されない。`--class-cut`とは同時に使用不可）
+- `--class-cut`: 境界で切り取られた物体を"cut"クラスに変換（タイルの境界で切り取られたポリゴンのラベルを"cut"に変換。元画像の端にある物体は変換されない。`--exclude-clipped`とは同時に使用不可）
 
 ## 特徴
 
@@ -292,6 +361,10 @@ python slice_pic.py -i ./dataset/train -o ./dataset/sliced --clear_pad 0.5 --vis
 - **ラベル自動変換**: ポリゴン座標を自動変換（Shapely使用）
 - **空タイルスキップ**: オブジェクトが含まれないタイルは自動スキップ
 - **パディング面積フィルタリング**: `--clear_pad`オプションでパディング面積が指定割合以上のタイルを削除（paddingモードのみ）
+- **境界切り取り処理**:
+  - `--exclude-clipped`オプション: タイルの境界で切り取られた物体を除外
+  - `--class-cut`オプション: タイルの境界で切り取られた物体を"cut"クラスに変換
+  - どちらも元画像の端にある物体には影響しない
 - **視覚化モード**: `--vis`オプションでタイル分割と視覚化画像を同時生成
 - **見やすい視覚化**: 削除対象タイルはオレンジ色の背景＋白色のXマークで一目で識別可能
 
@@ -528,6 +601,9 @@ python yolo_split.py -i ./yolo_dataset -o ./yolo_split --train 0.8 --val 0.2 --t
 # クラス名を指定してdata.yamlを生成
 python yolo_split.py -i ./yolo_dataset -o ./yolo_split --class-names pod flower leaf
 
+# "cut"クラスも含める場合（--class-cutオプションを使用した場合）
+python yolo_split.py -i ./yolo_dataset -o ./yolo_split --class-names pod cut
+
 # ランダムシードを指定（再現性のため）
 python yolo_split.py -i ./yolo_dataset -o ./yolo_split --seed 123
 ```
@@ -657,11 +733,14 @@ model.train(
 
 ```bash
 # 1. 画像をタイル分割（大きな画像を小さいタイルに分割）
-# Innerモード、30%オーバーラップ、視覚化付き
-python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-mode inner --overlap-ratio 0.3 --vis
+# Innerモード、30%オーバーラップ、境界切り取りを"cut"クラスに変換、視覚化付き
+python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-mode inner --overlap-ratio 0.3 --class-cut --vis
+
+# または、境界切り取りを除外する場合
+# python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-mode inner --overlap-ratio 0.3 --exclude-clipped --vis
 
 # または、Paddingモードで不要なタイルを削除
-# python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-mode padding --overlap 50 --clear_pad 0.5 --vis
+# python slice_pic.py -i PodSegDataset/train02 -o PodSegDataset/sliced --tile-mode padding --overlap 50 --clear_pad 0.5 --class-cut --vis
 
 # 2. インスタンスをクロップ
 python crop_and_segment.py -i PodSegDataset/sliced -o PodSegDataset/crop
@@ -670,7 +749,8 @@ python crop_and_segment.py -i PodSegDataset/sliced -o PodSegDataset/crop
 # convert_to_yolo.py などを使用
 
 # 4. データセットを分割（data.yaml も自動生成）
-python yolo_split.py -i Yolo_crop -o Yolo_split --train 0.7 --val 0.2 --test 0.1 --class-names pod
+# --class-cutを使用した場合は"cut"クラスも追加
+python yolo_split.py -i Yolo_crop -o Yolo_split --train 0.7 --val 0.2 --test 0.1 --class-names pod cut
 
 # 5. YOLOv8でトレーニング（自動生成されたdata.yamlを使用）
 cd Yolo_split
@@ -682,6 +762,9 @@ yolo train data=data.yaml model=yolov8n.pt epochs=100 imgsz=640
   - **Innerモード**: パディングなし（画像の外にはみ出さない）
   - **Paddingモード**: 元画像を保持（`--clear_pad`で不要タイル削除可能）
 - オーバーラップはピクセル数（`--overlap`）または割合（`--overlap-ratio`）で指定可能
+- 境界で切り取られた物体の処理方法を選択可能：
+  - `--exclude-clipped`: 切り取られた物体を除外
+  - `--class-cut`: 切り取られた物体を"cut"クラスに変換
 - `--vis`オプションで視覚化画像を生成して確認可能
 - ステップ4で`data.yaml`が自動生成されるので、手動で作成する必要はありません
 

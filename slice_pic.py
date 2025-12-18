@@ -19,7 +19,7 @@ from shapely.validation import make_valid
 
 
 # 定数
-DEFAULT_INPUT_DIR = 'PodSegDataset/train02'
+DEFAULT_INPUT_DIR = 'PodSegDataset/2024_40_pod/images'
 DEFAULT_OUTPUT_DIR = 'PodSegDataset/sliced'
 DEFAULT_TILE_SIZE = 640
 DEFAULT_OVERLAP = 50
@@ -41,6 +41,8 @@ class SliceConfig:
     clear_pad: float = 0.0  # 0.0=無効, 0.0~1.0=パディング面積の閾値
     tile_mode: str = 'padding'  # 'padding' or 'inner'
     overlap_ratio: float = 0.0  # 0.0=無効（overlap使用）、0.0~1.0=オーバーラップ割合
+    exclude_clipped: bool = False  # True=境界で切り取られたポリゴンを除外
+    class_cut: bool = False  # True=境界で切り取られたポリゴンのラベルを"cut"に変換
     
     def __post_init__(self):
         """設定の妥当性チェック"""
@@ -66,6 +68,10 @@ class SliceConfig:
         # innerモードではclear_padは使用できない
         if self.tile_mode == 'inner' and self.clear_pad > 0.0:
             raise ValueError("innerモードではclear_padオプションは使用できません（パディングが発生しないため）")
+        
+        # exclude_clippedとclass_cutは同時に使用できない
+        if self.exclude_clipped and self.class_cut:
+            raise ValueError("--exclude-clippedと--class-cutは同時に使用できません")
 
 
 @dataclass
@@ -96,6 +102,8 @@ class ImageTileSlicer:
         self.total_tiles = 0
         self.total_shapes = 0
         self.skipped_pad_tiles = 0  # パディング領域のみのタイルをスキップした数
+        self.excluded_clipped_shapes = 0  # 境界で切り取られたshapeを除外した数
+        self.class_cut_shapes = 0  # 境界で切り取られたshapeを"cut"クラスに変換した数
         # 出力ディレクトリに連番を付ける
         self.config.output_dir = self._get_numbered_output_dir(config.output_dir)
     
@@ -418,17 +426,21 @@ class ImageTileSlicer:
     def transform_polygon_to_tile(
         self, 
         points: List[List[float]], 
-        tile: TileInfo
-    ) -> Optional[List[List[float]]]:
+        tile: TileInfo,
+        image_width: Optional[int] = None,
+        image_height: Optional[int] = None
+    ) -> Optional[Tuple[List[List[float]], bool]]:
         """
         ポリゴン座標をタイル座標系に変換（正確なクリッピング）
         
         Args:
             points: 元画像のポリゴン座標
             tile: タイル情報
+            image_width: 元画像の幅（境界判定用、オプション）
+            image_height: 元画像の高さ（境界判定用、オプション）
         
         Returns:
-            変換後の座標（タイル外の場合はNone）
+            (変換後の座標, クリップされたか)のタプル（タイル外の場合はNone）
         """
         if not self.is_polygon_in_tile(points, tile):
             return None
@@ -483,11 +495,70 @@ class ImageTileSlicer:
             if test_polygon.area < 1.0:
                 return None
             
-            return transformed
+            # クリップされたかどうかを判定
+            is_clipped = self._is_polygon_clipped_at_boundary(
+                transformed, tile, image_width, image_height
+            )
+            
+            return transformed, is_clipped
             
         except Exception as e:
             # エラーが発生した場合はスキップ
             return None
+    
+    def _is_polygon_clipped_at_boundary(
+        self,
+        transformed_points: List[List[float]],
+        tile: TileInfo,
+        image_width: Optional[int] = None,
+        image_height: Optional[int] = None
+    ) -> bool:
+        """
+        ポリゴンがタイルの境界で切り取られたかを判定
+        
+        Args:
+            transformed_points: タイル座標系に変換されたポリゴン座標
+            tile: タイル情報
+            image_width: 元画像の幅（オプション）
+            image_height: 元画像の高さ（オプション）
+        
+        Returns:
+            境界で切り取られた場合True
+        """
+        # 許容誤差（浮動小数点の誤差を考慮）
+        epsilon = 0.5
+        
+        # タイルの境界（タイル座標系）
+        tile_left = 0
+        tile_right = self.config.tile_width if tile.needs_padding else tile.actual_width
+        tile_top = 0
+        tile_bottom = self.config.tile_height if tile.needs_padding else tile.actual_height
+        
+        # 元画像の境界判定用（画像の端にある場合は除外しない）
+        is_at_image_left = (tile.x_start == 0)
+        is_at_image_right = (image_width is not None and tile.x_end >= image_width)
+        is_at_image_top = (tile.y_start == 0)
+        is_at_image_bottom = (image_height is not None and tile.y_end >= image_height)
+        
+        # 各頂点をチェック
+        for x, y in transformed_points:
+            # 左端の境界（元画像の左端でない場合のみチェック）
+            if not is_at_image_left and abs(x - tile_left) < epsilon:
+                return True
+            
+            # 右端の境界（元画像の右端でない場合のみチェック）
+            if not is_at_image_right and abs(x - tile_right) < epsilon:
+                return True
+            
+            # 上端の境界（元画像の上端でない場合のみチェック）
+            if not is_at_image_top and abs(y - tile_top) < epsilon:
+                return True
+            
+            # 下端の境界（元画像の下端でない場合のみチェック）
+            if not is_at_image_bottom and abs(y - tile_bottom) < epsilon:
+                return True
+        
+        return False
     
     def is_polygon_only_in_padding(
         self,
@@ -612,7 +683,9 @@ class ImageTileSlicer:
         image: np.ndarray,
         tiles: List[TileInfo],
         output_path: Path,
-        label_data: Optional[Dict] = None
+        label_data: Optional[Dict] = None,
+        image_width: Optional[int] = None,
+        image_height: Optional[int] = None
     ) -> None:
         """
         タイル分割を視覚化した画像を生成
@@ -622,8 +695,14 @@ class ImageTileSlicer:
             tiles: タイル情報のリスト
             output_path: 出力パス
             label_data: ラベルデータ（clear_pad判定用、オプション）
+            image_width: 元画像の幅（オプション）
+            image_height: 元画像の高さ（オプション）
         """
         height, width = image.shape[:2]
+        if image_width is None:
+            image_width = width
+        if image_height is None:
+            image_height = height
         
         # 必要なキャンバスサイズを計算
         # innerモードの場合: 元画像と同じサイズ
@@ -660,7 +739,9 @@ class ImageTileSlicer:
         if label_data:
             for tile in tiles:
                 tile_filename = f"temp_tile_r{tile.row}_c{tile.col}.jpg"
-                tile_label = self.create_tile_label(label_data, tile, tile_filename)
+                tile_label = self.create_tile_label(
+                    label_data, tile, tile_filename, image_width, image_height
+                )
                 
                 # スキップ判定（実際の処理ロジックと同じ）
                 # 1. shapesが空の場合はスキップ
@@ -910,7 +991,9 @@ class ImageTileSlicer:
         self,
         original_label: Dict,
         tile: TileInfo,
-        tile_filename: str
+        tile_filename: str,
+        image_width: Optional[int] = None,
+        image_height: Optional[int] = None
     ) -> Dict:
         """
         タイル用の新しいラベルJSONを作成
@@ -919,6 +1002,8 @@ class ImageTileSlicer:
             original_label: 元のラベルデータ
             tile: タイル情報
             tile_filename: タイル画像のファイル名
+            image_width: 元画像の幅（境界判定用、オプション）
+            image_height: 元画像の高さ（境界判定用、オプション）
         
         Returns:
             新しいラベルデータ
@@ -943,13 +1028,30 @@ class ImageTileSlicer:
                 continue
             
             # ポリゴンをタイル座標系に変換
-            transformed_points = self.transform_polygon_to_tile(points, tile)
-            if not transformed_points:
+            result = self.transform_polygon_to_tile(points, tile, image_width, image_height)
+            if not result:
                 continue
+            
+            transformed_points, is_clipped = result
+            
+            # exclude_clippedが有効で、かつポリゴンが切り取られている場合はスキップ
+            if self.config.exclude_clipped and is_clipped:
+                self.excluded_clipped_shapes += 1
+                continue
+            
+            # ラベルを決定
+            original_label_name = shape.get("label", "")
+            if self.config.class_cut and is_clipped:
+                # class_cutが有効で、かつポリゴンが切り取られている場合はラベルを"cut"に変換
+                label_name = "cut"
+                self.class_cut_shapes += 1
+            else:
+                # それ以外は元のラベルを使用
+                label_name = original_label_name
             
             # 新しいshapeを追加
             new_shape = {
-                "label": shape.get("label", ""),
+                "label": label_name,
                 "shape_type": "polygon",
                 "flags": shape.get("flags", {}),
                 "points": transformed_points,
@@ -1005,7 +1107,7 @@ class ImageTileSlicer:
             vis_dir.mkdir(parents=True, exist_ok=True)
             
             vis_output_path = vis_dir / f"{label_path.stem}_visualization.jpg"
-            self.visualize_tiles(image, tiles, vis_output_path, label_data)
+            self.visualize_tiles(image, tiles, vis_output_path, label_data, width, height)
         
         # 各タイルを処理
         tile_count = 0
@@ -1017,7 +1119,9 @@ class ImageTileSlicer:
             
             # ファイル名を生成（元の画像名 + タイル位置）
             tile_filename = f"{base_name}_tile_r{tile.row}_c{tile.col}.jpg"
-            tile_label = self.create_tile_label(label_data, tile, tile_filename)
+            tile_label = self.create_tile_label(
+                label_data, tile, tile_filename, width, height
+            )
             
             # shapesが空の場合はスキップ（オブジェクトがないタイル）
             if not tile_label["shapes"]:
@@ -1083,6 +1187,10 @@ class ImageTileSlicer:
             tqdm.write(f"可視化: 有効 (visualization/に保存)")
         if self.config.clear_pad > 0.0:
             tqdm.write(f"パディング削除閾値: {self.config.clear_pad:.2%} 以上のパディング面積でスキップ")
+        if self.config.exclude_clipped:
+            tqdm.write(f"境界切り取り除外: 有効（境界で切り取られた物体を除外）")
+        if self.config.class_cut:
+            tqdm.write(f"クラス変換: 有効（境界で切り取られた物体を\"cut\"クラスに変換）")
         tqdm.write("-" * 70)
         
         # 出力ディレクトリ作成
@@ -1115,6 +1223,10 @@ class ImageTileSlicer:
         tqdm.write(f"   変換shape数: {self.total_shapes}個")
         if self.config.clear_pad > 0.0 and self.skipped_pad_tiles > 0:
             tqdm.write(f"   スキップ（パディング{self.config.clear_pad:.2%}以上）: {self.skipped_pad_tiles}個")
+        if self.config.exclude_clipped and self.excluded_clipped_shapes > 0:
+            tqdm.write(f"   除外（境界切り取り）: {self.excluded_clipped_shapes}個のshape")
+        if self.config.class_cut and self.class_cut_shapes > 0:
+            tqdm.write(f"   クラス変換（\"cut\"に変換）: {self.class_cut_shapes}個のshape")
         if self.config.visualize:
             tqdm.write(f"   視覚化画像: {len(label_files)}枚生成")
             tqdm.write(f"   視覚化保存先: {self.config.output_dir / 'visualization'}")
@@ -1166,6 +1278,12 @@ def main():
   
   # パディング面積で削除（paddingモードのみ）
   python slice_pic.py -i ./dataset/images -o ./dataset/sliced --clear_pad 0.5 --vis
+  
+  # 境界で切り取られた物体を除外
+  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --exclude-clipped --vis
+  
+  # 境界で切り取られた物体を"cut"クラスに変換
+  python slice_pic.py -i ./dataset/images -o ./dataset/sliced --class-cut --vis
 
 詳細な使い方はREADME.mdを参照してください。
         """
@@ -1233,6 +1351,20 @@ def main():
         help='パディング面積の閾値（0.0~1.0）: この割合以上のパディングを含むタイルを削除（例: 0.5=50%%, 0.75=75%%）'
     )
     
+    parser.add_argument(
+        '--exclude-clipped',
+        action='store_true',
+        dest='exclude_clipped',
+        help='境界で切り取られた物体を除外: タイルの境界で切り取られたポリゴンを除外する（元画像の端にある物体は除外されない）'
+    )
+    
+    parser.add_argument(
+        '--class-cut',
+        action='store_true',
+        dest='class_cut',
+        help='境界で切り取られた物体のラベルを"cut"に変換: タイルの境界で切り取られたポリゴンのクラスラベルを"cut"に変換する（元画像の端にある物体は変換されない。--exclude-clippedとは同時に使用できない）'
+    )
+    
     args = parser.parse_args()
     
     # 入力ディレクトリの確認
@@ -1264,6 +1396,12 @@ def main():
         tqdm.write(f"   innerモードではパディングが発生しないため、clear_padオプションは無効です")
         return
     
+    # exclude_clippedとclass_cutの組み合わせチェック
+    if args.exclude_clipped and args.class_cut:
+        tqdm.write(f"❌ エラー: --exclude-clipped と --class-cut は同時に使用できません")
+        tqdm.write(f"   どちらか一方を選択してください")
+        return
+    
     # 設定を作成
     try:
         config = SliceConfig(
@@ -1276,7 +1414,9 @@ def main():
             visualize=args.visualize,
             clear_pad=args.clear_pad,
             tile_mode=args.tile_mode,
-            overlap_ratio=args.overlap_ratio
+            overlap_ratio=args.overlap_ratio,
+            exclude_clipped=args.exclude_clipped,
+            class_cut=args.class_cut
         )
     except ValueError as e:
         tqdm.write(f"❌ エラー: {e}")
